@@ -1,0 +1,47 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# IDE files
+.vs/
+.vscode/
+*.user
+*.suo
+*.vcxproj
+*.vcxproj.filters
+*.sln
+
+# Compiled files
+*.dll
+*.so
+*.dylib
+*.plugin
+*.o
+*.obj
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# Windows
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Backup files
+*~
+*.bak
+*.swp
+
+
+
+
+

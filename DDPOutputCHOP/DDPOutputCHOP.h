@@ -1,17 +1,22 @@
 #ifndef __DDPOutputCHOP__
 #define __DDPOutputCHOP__
 
+// Must include winsock2 before Windows.h to avoid conflicts
+#ifdef _WIN32
+    #define WIN32_LEAN_AND_MEAN
+    #define NOMINMAX  // Prevent Windows from defining min/max macros
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+#endif
+
 #include "CHOP_CPlusPlusBase.h"
 #include <vector>
 #include <string>
 
 using namespace TD;
 
-#ifdef _WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #pragma comment(lib, "ws2_32.lib")
-#else
+#ifndef _WIN32
     #include <sys/socket.h>
     #include <netinet/in.h>
     #include <arpa/inet.h>

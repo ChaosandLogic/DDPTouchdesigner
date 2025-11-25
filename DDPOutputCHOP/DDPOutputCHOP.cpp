@@ -796,7 +796,7 @@ void DDPOutputCHOP::discoverDevices()
     
     // Restore blocking mode
     #ifdef _WIN32
-        u_long mode = 0;  // 0 = blocking
+        mode = 0;  // 0 = blocking
         ioctlsocket(m_socket, FIONBIO, &mode);
     #else
         sockFlags = fcntl(m_socket, F_GETFL, 0);

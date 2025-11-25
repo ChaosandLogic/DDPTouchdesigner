@@ -15,8 +15,8 @@ extern "C"
         info->apiVersion = CHOPCPlusPlusAPIVersion;
         info->customOPInfo.opType->setString("Ddpout");
         info->customOPInfo.opLabel->setString("DDP Out");
-        info->customOPInfo.authorName->setString("DDP");
-        info->customOPInfo.authorEmail->setString("ddp@test.com");
+        info->customOPInfo.authorName->setString("Glen Wilde");
+        info->customOPInfo.authorEmail->setString("Glen.w.wilde@gmail.com");
         info->customOPInfo.minInputs = 1;
         info->customOPInfo.maxInputs = 1;
         

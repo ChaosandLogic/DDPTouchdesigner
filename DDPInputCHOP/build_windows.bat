@@ -1,6 +1,8 @@
 @echo off
 echo ==========================================
 echo DDP Input CHOP - Windows Build Script
+echo Author: Glen Wilde
+echo Email: Glen.w.wilde@gmail.com
 echo ==========================================
 echo.
 

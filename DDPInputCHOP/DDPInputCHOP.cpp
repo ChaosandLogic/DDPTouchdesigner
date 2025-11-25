@@ -13,8 +13,8 @@ extern "C"
         info->apiVersion = CHOPCPlusPlusAPIVersion;
         info->customOPInfo.opType->setString("Ddpin");
         info->customOPInfo.opLabel->setString("DDP In");
-        info->customOPInfo.authorName->setString("DDP");
-        info->customOPInfo.authorEmail->setString("ddp@test.com");
+        info->customOPInfo.authorName->setString("Glen Wilde");
+        info->customOPInfo.authorEmail->setString("Glen.w.wilde@gmail.com");
         info->customOPInfo.minInputs = 0;  // No input needed
         info->customOPInfo.maxInputs = 0;  // Pure receiver
         

@@ -49,6 +49,13 @@ using namespace TD;
 #define DDP_DATA_TYPE_HSL  0x02
 #define DDP_DATA_TYPE_RGBW 0x03
 
+// Pixel Format enum
+enum class PixelFormat
+{
+    RGB = 0,
+    RGBW = 1
+};
+
 class DDPOutputCHOP : public CHOP_CPlusPlusBase
 {
 public:
@@ -77,17 +84,20 @@ private:
     
     // DDP packet creation and sending
     void createDDPPacket(const uint8_t* pixelData, size_t dataLength, 
-                         size_t offset, bool pushFlag, std::vector<uint8_t>& packet);
-    void sendDDPData(const std::vector<uint8_t>& pixelData);
+                         size_t offset, bool pushFlag, std::vector<uint8_t>& packet,
+                         PixelFormat format);
+    void sendDDPData(const std::vector<uint8_t>& pixelData, PixelFormat format);
     void sendPushPacket();
     
     // Data processing
     void processInterleavedChannels(const OP_CHOPInput* chopInput, 
                                      float gamma, float brightness,
-                                     std::vector<uint8_t>& rgbData);
+                                     std::vector<uint8_t>& pixelData,
+                                     PixelFormat format);
     void processSequentialChannels(const OP_CHOPInput* chopInput,
                                     float gamma, float brightness,
-                                    std::vector<uint8_t>& rgbData);
+                                    std::vector<uint8_t>& pixelData,
+                                    PixelFormat format);
     
     // Helper functions
     uint8_t floatToUint8(float value);

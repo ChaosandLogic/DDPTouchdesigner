@@ -245,9 +245,28 @@ void DDPOutputCHOP::initializeSocket()
         return;
     }
     
+    // Enable address reuse (allows binding even if port is in use)
+    BOOL reuseAddr = TRUE;
+    setsockopt(m_socket, SOL_SOCKET, SO_REUSEADDR, (char*)&reuseAddr, sizeof(reuseAddr));
+    
     // Enable broadcast
     BOOL broadcastEnable = TRUE;
     setsockopt(m_socket, SOL_SOCKET, SO_BROADCAST, (char*)&broadcastEnable, sizeof(broadcastEnable));
+    
+    // Bind to any local address on DDP port to receive broadcast responses
+    struct sockaddr_in localAddr;
+    memset(&localAddr, 0, sizeof(localAddr));
+    localAddr.sin_family = AF_INET;
+    localAddr.sin_addr.s_addr = INADDR_ANY;
+    localAddr.sin_port = htons(0);  // Use ephemeral port for sending, but we'll listen on this socket
+    
+    if (bind(m_socket, (struct sockaddr*)&localAddr, sizeof(localAddr)) == SOCKET_ERROR)
+    {
+        m_lastError = "Socket bind failed";
+        closesocket(m_socket);
+        m_socket = INVALID_SOCKET;
+        return;
+    }
     
     #else
     m_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -258,9 +277,29 @@ void DDPOutputCHOP::initializeSocket()
         return;
     }
     
+    // Enable address reuse (allows binding even if port is in use)
+    int reuseAddr = 1;
+    setsockopt(m_socket, SOL_SOCKET, SO_REUSEADDR, &reuseAddr, sizeof(reuseAddr));
+    
     // Enable broadcast
     int broadcastEnable = 1;
     setsockopt(m_socket, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
+    
+    // Bind to any local address on DDP port to receive broadcast responses
+    struct sockaddr_in localAddr;
+    memset(&localAddr, 0, sizeof(localAddr));
+    localAddr.sin_family = AF_INET;
+    localAddr.sin_addr.s_addr = INADDR_ANY;
+    localAddr.sin_port = htons(0);  // Use ephemeral port for sending, but we'll listen on this socket
+    
+    if (bind(m_socket, (struct sockaddr*)&localAddr, sizeof(localAddr)) < 0)
+    {
+        int error = errno;
+        m_lastError = "Socket bind failed, errno " + std::to_string(error) + ": " + strerror(error);
+        close(m_socket);
+        m_socket = -1;
+        return;
+    }
     #endif
     
     m_socketInitialized = true;
@@ -694,13 +733,6 @@ void DDPOutputCHOP::sendQueryPacket()
     packet[8] = 0;                        // Length = 0
     packet[9] = 0;
     
-    // Send to broadcast address
-    struct sockaddr_in broadcastAddr;
-    memset(&broadcastAddr, 0, sizeof(broadcastAddr));
-    broadcastAddr.sin_family = AF_INET;
-    broadcastAddr.sin_port = htons(DDP_PORT);
-    broadcastAddr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-    
     // Enable broadcast on socket
     int broadcastEnable = 1;
     #ifdef _WIN32
@@ -709,12 +741,33 @@ void DDPOutputCHOP::sendQueryPacket()
         setsockopt(m_socket, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
     #endif
     
+    // Send to broadcast address (255.255.255.255)
+    struct sockaddr_in broadcastAddr;
+    memset(&broadcastAddr, 0, sizeof(broadcastAddr));
+    broadcastAddr.sin_family = AF_INET;
+    broadcastAddr.sin_port = htons(DDP_PORT);
+    broadcastAddr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    
     sendto(m_socket, 
            reinterpret_cast<const char*>(packet.data()), 
            static_cast<int>(packet.size()), 
            0,
            reinterpret_cast<struct sockaddr*>(&broadcastAddr), 
            sizeof(broadcastAddr));
+    
+    // Also try sending to the configured destination (if it's set)
+    if (m_destAddr.sin_addr.s_addr != 0)
+    {
+        struct sockaddr_in targetAddr = m_destAddr;
+        targetAddr.sin_port = htons(DDP_PORT);
+        
+        sendto(m_socket, 
+               reinterpret_cast<const char*>(packet.data()), 
+               static_cast<int>(packet.size()), 
+               0,
+               reinterpret_cast<struct sockaddr*>(&targetAddr), 
+               sizeof(targetAddr));
+    }
 }
 
 void DDPOutputCHOP::discoverDevices()
@@ -729,8 +782,18 @@ void DDPOutputCHOP::discoverDevices()
     m_discoveredDevices.clear();
     m_isDiscovering = true;
     
-    // Send query packet
-    sendQueryPacket();
+    m_lastError = "Sending discovery query...";
+    
+    // Send query packet (try multiple times)
+    for (int i = 0; i < 3; i++)
+    {
+        sendQueryPacket();
+        #ifdef _WIN32
+            Sleep(50);
+        #else
+            usleep(50000);
+        #endif
+    }
     
     // Set socket to non-blocking temporarily
     #ifdef _WIN32
@@ -741,7 +804,7 @@ void DDPOutputCHOP::discoverDevices()
         fcntl(m_socket, F_SETFL, sockFlags | O_NONBLOCK);
     #endif
     
-    // Listen for responses for ~100ms
+    // Listen for responses for ~500ms (longer timeout for FPP)
     char buffer[2048];
     struct sockaddr_in responseAddr;
     
@@ -752,37 +815,52 @@ void DDPOutputCHOP::discoverDevices()
     #endif
     
     // Try to receive responses (non-blocking)
-    for (int i = 0; i < 10; i++)  // 10 attempts with ~10ms between
+    int packetsReceived = 0;
+    for (int i = 0; i < 50; i++)  // 50 attempts with ~10ms between = 500ms total
     {
+        #ifdef _WIN32
+            addrLen = sizeof(responseAddr);
+        #else
+            addrLen = sizeof(responseAddr);
+        #endif
+        
         int received = recvfrom(m_socket, buffer, sizeof(buffer), 0,
                                reinterpret_cast<struct sockaddr*>(&responseAddr),
                                &addrLen);
         
-        if (received > 10)  // At least DDP header
+        if (received > 0)
         {
-            // Check if it's a REPLY packet (flag 0x04)
-            if ((buffer[0] & 0x04) && static_cast<uint8_t>(buffer[3]) == DDP_ID_STATUS)
+            packetsReceived++;
+            
+            // Get IP address regardless of packet content
+            char ipStr[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &responseAddr.sin_addr, ipStr, INET_ADDRSTRLEN);
+            
+            // Store discovered device - be very permissive
+            // Accept ANY UDP response on ANY port as a potential DDP device
+            std::string deviceInfo = std::string(ipStr);
+            
+            // Add port if not standard DDP port
+            if (ntohs(responseAddr.sin_port) != DDP_PORT)
             {
-                // Get IP address
-                char ipStr[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &responseAddr.sin_addr, ipStr, INET_ADDRSTRLEN);
-                
-                // Store discovered device
-                std::string deviceInfo = std::string(ipStr);
-                
-                // Check for duplicates
-                bool found = false;
-                for (const auto& dev : m_discoveredDevices)
+                deviceInfo += ":" + std::to_string(ntohs(responseAddr.sin_port));
+            }
+            
+            // Check for duplicates
+            bool found = false;
+            for (const auto& dev : m_discoveredDevices)
+            {
+                if (dev == deviceInfo)
                 {
-                    if (dev == deviceInfo)
-                    {
-                        found = true;
-                        break;
-                    }
+                    found = true;
+                    break;
                 }
-                
-                if (!found)
-                    m_discoveredDevices.push_back(deviceInfo);
+            }
+            
+            if (!found)
+            {
+                m_discoveredDevices.push_back(deviceInfo);
+                m_lastError = "Found device: " + deviceInfo + " (packet size: " + std::to_string(received) + ")";
             }
         }
         
@@ -793,6 +871,8 @@ void DDPOutputCHOP::discoverDevices()
             usleep(10000);  // 10ms
         #endif
     }
+    
+    m_lastError = "Discovery scan complete. Received " + std::to_string(packetsReceived) + " packets";
     
     // Restore blocking mode
     #ifdef _WIN32
@@ -807,7 +887,7 @@ void DDPOutputCHOP::discoverDevices()
     
     if (m_discoveredDevices.empty())
     {
-        m_lastError = "No devices found. Make sure devices are powered on and on same network.";
+        m_lastError += " - No devices responded. Check: 1) Device is on, 2) Same network/subnet, 3) Windows firewall, 4) Try entering IP manually";
     }
     else
     {

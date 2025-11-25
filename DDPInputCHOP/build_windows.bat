@@ -32,20 +32,27 @@ cd build
 
 echo.
 echo Configuring with CMake...
-cmake .. -G "Visual Studio 17 2022" -A x64
+cmake .. -G "Visual Studio 18 2026" -A x64
 if errorlevel 1 (
     echo.
-    echo ERROR: CMake configuration failed!
+    echo ERROR: CMake configuration failed with VS2026!
     echo.
-    echo Trying Visual Studio 2019...
-    cmake .. -G "Visual Studio 16 2019" -A x64
+    echo Trying Visual Studio 2022...
+    cmake .. -G "Visual Studio 17 2022" -A x64
     if errorlevel 1 (
-        echo ERROR: CMake configuration failed with VS2019 too!
         echo.
-        echo Make sure Visual Studio 2019 or 2022 is installed with C++ tools.
+        echo ERROR: CMake configuration failed with VS2022!
         echo.
-        pause
-        exit /b 1
+        echo Trying Visual Studio 2019...
+        cmake .. -G "Visual Studio 16 2019" -A x64
+        if errorlevel 1 (
+            echo ERROR: CMake configuration failed with all Visual Studio versions!
+            echo.
+            echo Make sure Visual Studio 2019, 2022, or 2026 is installed with C++ tools.
+            echo.
+            pause
+            exit /b 1
+        )
     )
 )
 

@@ -49,13 +49,6 @@ using namespace TD;
 #define DDP_DATA_TYPE_HSL  0x02
 #define DDP_DATA_TYPE_RGBW 0x03
 
-// Pixel Format enum
-enum class PixelFormat
-{
-    RGB = 0,
-    RGBW = 1
-};
-
 class DDPOutputCHOP : public CHOP_CPlusPlusBase
 {
 public:
@@ -84,20 +77,17 @@ private:
     
     // DDP packet creation and sending
     void createDDPPacket(const uint8_t* pixelData, size_t dataLength, 
-                         size_t offset, bool pushFlag, std::vector<uint8_t>& packet,
-                         PixelFormat format);
-    void sendDDPData(const std::vector<uint8_t>& pixelData, PixelFormat format);
+                         size_t offset, bool pushFlag, std::vector<uint8_t>& packet);
+    void sendDDPData(const std::vector<uint8_t>& pixelData);
     void sendPushPacket();
     
     // Data processing
     void processInterleavedChannels(const OP_CHOPInput* chopInput, 
                                      float gamma, float brightness,
-                                     std::vector<uint8_t>& pixelData,
-                                     PixelFormat format);
+                                     std::vector<uint8_t>& pixelData);
     void processSequentialChannels(const OP_CHOPInput* chopInput,
                                     float gamma, float brightness,
-                                    std::vector<uint8_t>& pixelData,
-                                    PixelFormat format);
+                                    std::vector<uint8_t>& pixelData);
     
     // Helper functions
     uint8_t floatToUint8(float value);
@@ -121,6 +111,7 @@ private:
     uint8_t m_sequenceNumber;
     int64_t m_packetsSent;
     int64_t m_bytesSent;
+    int32_t m_lastChannelCount;
     int32_t m_lastPixelCount;
     std::string m_lastError;
     std::string m_lastIPAddress;

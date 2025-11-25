@@ -166,6 +166,20 @@ void DDPOutputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved
         assert(res == OP_ParAppendResult::Success);
     }
     
+    // Pixel Format (RGB vs RGBW)
+    {
+        OP_StringParameter sp;
+        sp.name = "Pixelformat";
+        sp.label = "Pixel Format";
+        sp.defaultValue = "RGB";
+        
+        const char* names[] = { "RGB", "RGBW" };
+        const char* labels[] = { "RGB (3 channels)", "RGBW (4 channels)" };
+        
+        OP_ParAppendResult res = manager->appendMenu(sp, 2, names, labels);
+        assert(res == OP_ParAppendResult::Success);
+    }
+    
     // Auto Push (for single device vs multi-device sync)
     {
         OP_NumericParameter np;
@@ -326,7 +340,8 @@ void DDPOutputCHOP::closeSocket()
 }
 
 void DDPOutputCHOP::createDDPPacket(const uint8_t* pixelData, size_t dataLength, 
-                                     size_t offset, bool pushFlag, std::vector<uint8_t>& packet)
+                                     size_t offset, bool pushFlag, std::vector<uint8_t>& packet,
+                                     PixelFormat format)
 {
     packet.resize(DDP_HEADER_SIZE + dataLength);
     
@@ -338,8 +353,8 @@ void DDPOutputCHOP::createDDPPacket(const uint8_t* pixelData, size_t dataLength,
     // Byte 1: Sequence number (lower 4 bits)
     packet[1] = m_sequenceNumber & 0x0F;
     
-    // Byte 2: Data type (RGB)
-    packet[2] = DDP_DATA_TYPE_RGB;
+    // Byte 2: Data type (RGB or RGBW)
+    packet[2] = (format == PixelFormat::RGBW) ? DDP_DATA_TYPE_RGBW : DDP_DATA_TYPE_RGB;
     
     // Byte 3: Destination ID (Display)
     packet[3] = DDP_ID_DISPLAY;
@@ -363,13 +378,14 @@ void DDPOutputCHOP::createDDPPacket(const uint8_t* pixelData, size_t dataLength,
     m_sequenceNumber = (m_sequenceNumber + 1) & 0x0F;
 }
 
-void DDPOutputCHOP::sendDDPData(const std::vector<uint8_t>& pixelData)
+void DDPOutputCHOP::sendDDPData(const std::vector<uint8_t>& pixelData, PixelFormat format)
 {
     if (!m_socketInitialized || pixelData.empty())
         return;
     
     size_t totalBytes = pixelData.size();
-    size_t totalPixels = totalBytes / 3;
+    int bytesPerPixel = (format == PixelFormat::RGBW) ? 4 : 3;
+    size_t totalPixels = totalBytes / bytesPerPixel;
     size_t bytesSent = 0;
     
     // Determine if this is the last packet for auto-push
@@ -385,7 +401,7 @@ void DDPOutputCHOP::sendDDPData(const std::vector<uint8_t>& pixelData)
         bool pushFlag = autoPush && isLastPacket;
         
         std::vector<uint8_t> packet;
-        createDDPPacket(&pixelData[bytesSent], bytesInPacket, bytesSent, pushFlag, packet);
+        createDDPPacket(&pixelData[bytesSent], bytesInPacket, bytesSent, pushFlag, packet, format);
         
         int sendResult = sendto(m_socket, 
                                reinterpret_cast<const char*>(packet.data()), 
@@ -471,26 +487,29 @@ float DDPOutputCHOP::applyGamma(float value, float gamma)
 
 void DDPOutputCHOP::processInterleavedChannels(const OP_CHOPInput* chopInput, 
                                                  float gamma, float brightness,
-                                                 std::vector<uint8_t>& rgbData)
+                                                 std::vector<uint8_t>& pixelData,
+                                                 PixelFormat format)
 {
-    // Like DMX Out CHOP: expects 1 channel with samples as r0,g0,b0,r1,g1,b1...
-    // Use first channel only
+    // Like DMX Out CHOP: expects 1 channel with samples
+    // RGB:  r0,g0,b0,r1,g1,b1...
+    // RGBW: r0,g0,b0,w0,r1,g1,b1,w1...
     if (chopInput->numChannels < 1)
         return;
     
     const float* channelData = chopInput->getChannelData(0);
     int numSamples = chopInput->numSamples;
-    int numPixels = numSamples / 3;
+    int channelsPerPixel = (format == PixelFormat::RGBW) ? 4 : 3;
+    int numPixels = numSamples / channelsPerPixel;
     
-    rgbData.reserve(numPixels * 3);
+    pixelData.reserve(numPixels * channelsPerPixel);
     
     for (int pixel = 0; pixel < numPixels; pixel++)
     {
-        int idx = pixel * 3;
+        int idx = pixel * channelsPerPixel;
         
-        if (idx + 2 < numSamples)
+        if (idx + channelsPerPixel - 1 < numSamples)
         {
-            // Get RGB values from consecutive samples
+            // Get RGB(W) values from consecutive samples
             float r = channelData[idx + 0];
             float g = channelData[idx + 1];
             float b = channelData[idx + 2];
@@ -506,29 +525,41 @@ void DDPOutputCHOP::processInterleavedChannels(const OP_CHOPInput* chopInput,
             b = applyGamma(b, gamma);
             
             // Convert to 8-bit
-            rgbData.push_back(floatToUint8(r));
-            rgbData.push_back(floatToUint8(g));
-            rgbData.push_back(floatToUint8(b));
+            pixelData.push_back(floatToUint8(r));
+            pixelData.push_back(floatToUint8(g));
+            pixelData.push_back(floatToUint8(b));
+            
+            // Handle white channel for RGBW
+            if (format == PixelFormat::RGBW)
+            {
+                float w = channelData[idx + 3];
+                w *= brightness;
+                w = applyGamma(w, gamma);
+                pixelData.push_back(floatToUint8(w));
+            }
         }
     }
 }
 
 void DDPOutputCHOP::processSequentialChannels(const OP_CHOPInput* chopInput,
                                                 float gamma, float brightness,
-                                                std::vector<uint8_t>& rgbData)
+                                                std::vector<uint8_t>& pixelData,
+                                                PixelFormat format)
 {
-    // Sequential: separate R, G, B channels with multiple samples
+    // Sequential: separate R, G, B (W) channels with multiple samples
     int numChannels = chopInput->numChannels;
     int numSamples = chopInput->numSamples;
+    int requiredChannels = (format == PixelFormat::RGBW) ? 4 : 3;
     
-    if (numChannels < 3)
+    if (numChannels < requiredChannels)
         return;
     
     const float* rChannel = chopInput->getChannelData(0);
     const float* gChannel = chopInput->getChannelData(1);
     const float* bChannel = chopInput->getChannelData(2);
+    const float* wChannel = (format == PixelFormat::RGBW) ? chopInput->getChannelData(3) : nullptr;
     
-    rgbData.reserve(numSamples * 3);
+    pixelData.reserve(numSamples * requiredChannels);
     
     for (int i = 0; i < numSamples; i++)
     {
@@ -547,9 +578,18 @@ void DDPOutputCHOP::processSequentialChannels(const OP_CHOPInput* chopInput,
         b = applyGamma(b, gamma);
         
         // Convert to 8-bit
-        rgbData.push_back(floatToUint8(r));
-        rgbData.push_back(floatToUint8(g));
-        rgbData.push_back(floatToUint8(b));
+        pixelData.push_back(floatToUint8(r));
+        pixelData.push_back(floatToUint8(g));
+        pixelData.push_back(floatToUint8(b));
+        
+        // Handle white channel for RGBW
+        if (format == PixelFormat::RGBW && wChannel)
+        {
+            float w = wChannel[i];
+            w *= brightness;
+            w = applyGamma(w, gamma);
+            pixelData.push_back(floatToUint8(w));
+        }
     }
 }
 
@@ -561,6 +601,8 @@ void DDPOutputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* 
     bool enabled = inputs->getParInt("Enable") != 0;
     float gamma = static_cast<float>(inputs->getParDouble("Gamma"));
     float brightness = static_cast<float>(inputs->getParDouble("Brightness"));
+    const char* pixelFormatStr = inputs->getParString("Pixelformat");
+    PixelFormat pixelFormat = (strcmp(pixelFormatStr, "RGBW") == 0) ? PixelFormat::RGBW : PixelFormat::RGB;
     bool autoPush = inputs->getParInt("Autopush") != 0;
     bool showStats = inputs->getParInt("Showstats") != 0;
     double maxFPS = inputs->getParDouble("Maxfps");
@@ -625,18 +667,20 @@ void DDPOutputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* 
         return; // Skip this frame to maintain target FPS
     }
     
-    // Process channel data (expects 1 channel with samples: r0,g0,b0,r1,g1,b1...)
-    // Like DMX Out CHOP - use Shuffle CHOP to arrange RGB into one channel
-    std::vector<uint8_t> rgbData;
-    processInterleavedChannels(chopInput, gamma, brightness, rgbData);
+    // Process channel data (expects 1 channel with samples)
+    // RGB:  r0,g0,b0,r1,g1,b1...
+    // RGBW: r0,g0,b0,w0,r1,g1,b1,w1...
+    std::vector<uint8_t> pixelData;
+    processInterleavedChannels(chopInput, gamma, brightness, pixelData, pixelFormat);
     
     // Update pixel count
-    m_lastPixelCount = static_cast<int32_t>(rgbData.size() / 3);
+    int bytesPerPixel = (pixelFormat == PixelFormat::RGBW) ? 4 : 3;
+    m_lastPixelCount = static_cast<int32_t>(pixelData.size() / bytesPerPixel);
     
     // Send DDP packets if we have data
-    if (!rgbData.empty())
+    if (!pixelData.empty())
     {
-        sendDDPData(rgbData);
+        sendDDPData(pixelData, pixelFormat);
     }
 }
 

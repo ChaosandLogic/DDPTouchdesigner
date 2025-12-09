@@ -4,7 +4,7 @@ Send and receive DDP (Distributed Display Protocol) data in TouchDesigner. Contr
 
 ## Installation
 
-**Download prebuilt plugins from the [Releases](../../releases) page.**
+**Download prebuilt plugins from the [Releases](Release) page.**
 
 - **macOS**: Copy `.plugin` folders to `~/Library/Application Support/Derivative/TouchDesigner099/Plugins/`
 - **Windows**: Copy `.dll` files to `%USERPROFILE%/Documents/Derivative/Plugins/`

@@ -206,6 +206,20 @@ void DDPOutputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved
         assert(res == OP_ParAppendResult::Success);
     }
     
+    // Value Range (0-1 or 0-255)
+    {
+        OP_StringParameter sp;
+        sp.name = "Valuerange";
+        sp.label = "Value Range";
+        sp.defaultValue = "0-1";
+        
+        const char* names[] = {"0-1", "0-255"};
+        const char* labels[] = {"0-1 (Normalized)", "0-255 (8-bit)"};
+        
+        OP_ParAppendResult res = manager->appendMenu(sp, 2, names, labels);
+        assert(res == OP_ParAppendResult::Success);
+    }
+    
     // Max FPS
     {
         OP_NumericParameter np;
@@ -469,27 +483,47 @@ void DDPOutputCHOP::sendPushPacket()
     m_sequenceNumber = (m_sequenceNumber + 1) & 0x0F;
 }
 
-uint8_t DDPOutputCHOP::floatToUint8(float value)
+uint8_t DDPOutputCHOP::floatToUint8(float value, bool normalizedInput)
 {
-    // Clamp to 0-1 range, then convert to 0-255
-    value = std::max(0.0f, std::min(1.0f, value));
-    return static_cast<uint8_t>(value * 255.0f);
+    if (normalizedInput)
+    {
+        // Input is 0-1 range, convert to 0-255
+        value = std::max(0.0f, std::min(1.0f, value));
+        return static_cast<uint8_t>(value * 255.0f);
+    }
+    else
+    {
+        // Input is 0-255 range, just clamp and convert
+        value = std::max(0.0f, std::min(255.0f, value));
+        return static_cast<uint8_t>(value);
+    }
 }
 
-float DDPOutputCHOP::applyGamma(float value, float gamma)
+float DDPOutputCHOP::applyGamma(float value, float gamma, bool normalizedInput)
 {
     if (gamma == 1.0f)
         return value;
+    
+    // Normalize to 0-1 for gamma calculation if input is 0-255
+    if (!normalizedInput)
+        value = value / 255.0f;
     
     // Clamp input
     value = std::max(0.0f, std::min(1.0f, value));
     
     // Apply gamma correction
-    return std::pow(value, 1.0f / gamma);
+    value = std::pow(value, 1.0f / gamma);
+    
+    // Convert back to 0-255 if input was 0-255
+    if (!normalizedInput)
+        value = value * 255.0f;
+    
+    return value;
 }
 
 void DDPOutputCHOP::processInterleavedChannels(const OP_CHOPInput* chopInput, 
                                                  float gamma, float brightness,
+                                                 bool normalizedInput,
                                                  std::vector<uint8_t>& pixelData)
 {
     // Like DMX Out CHOP: expects 1 channel with consecutive samples
@@ -507,19 +541,23 @@ void DDPOutputCHOP::processInterleavedChannels(const OP_CHOPInput* chopInput,
     {
         float value = channelData[i];
         
-        // Apply brightness
-        value *= brightness;
+        // Apply brightness (scale appropriately based on input range)
+        if (normalizedInput)
+            value *= brightness;
+        else
+            value *= brightness; // brightness is 0-1, so this scales 0-255 down proportionally
         
         // Apply gamma correction
-        value = applyGamma(value, gamma);
+        value = applyGamma(value, gamma, normalizedInput);
         
         // Convert to 8-bit
-        pixelData.push_back(floatToUint8(value));
+        pixelData.push_back(floatToUint8(value, normalizedInput));
     }
 }
 
 void DDPOutputCHOP::processSequentialChannels(const OP_CHOPInput* chopInput,
                                                 float gamma, float brightness,
+                                                bool normalizedInput,
                                                 std::vector<uint8_t>& pixelData)
 {
     // Sequential: separate channels with multiple samples
@@ -541,14 +579,17 @@ void DDPOutputCHOP::processSequentialChannels(const OP_CHOPInput* chopInput,
             const float* channelData = chopInput->getChannelData(channel);
             float value = channelData[sample];
             
-            // Apply brightness
-            value *= brightness;
+            // Apply brightness (scale appropriately based on input range)
+            if (normalizedInput)
+                value *= brightness;
+            else
+                value *= brightness; // brightness is 0-1, so this scales 0-255 down proportionally
             
             // Apply gamma correction
-            value = applyGamma(value, gamma);
+            value = applyGamma(value, gamma, normalizedInput);
             
             // Convert to 8-bit
-            pixelData.push_back(floatToUint8(value));
+            pixelData.push_back(floatToUint8(value, normalizedInput));
         }
     }
 }
@@ -565,6 +606,8 @@ void DDPOutputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* 
     bool autoPush = inputs->getParInt("Autopush") != 0;
     bool showStats = inputs->getParInt("Showstats") != 0;
     double maxFPS = inputs->getParDouble("Maxfps");
+    const char* valueRange = inputs->getParString("Valuerange");
+    bool normalizedInput = (strcmp(valueRange, "0-1") == 0);
     
     // Reset stats when toggling
     if (showStats != m_showStats)
@@ -631,7 +674,7 @@ void DDPOutputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* 
     // Like DMX Out: agnostic to format (RGB, RGBW, or any channel count)
     // Examples: r0,g0,b0,r1,g1,b1... or r0,g0,b0,w0,r1,g1,b1,w1...
     std::vector<uint8_t> pixelData;
-    processInterleavedChannels(chopInput, gamma, brightness, pixelData);
+    processInterleavedChannels(chopInput, gamma, brightness, normalizedInput, pixelData);
     
     // Update channel and pixel counts
     m_lastChannelCount = static_cast<int32_t>(pixelData.size());

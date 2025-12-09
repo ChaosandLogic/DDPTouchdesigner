@@ -84,14 +84,16 @@ private:
     // Data processing
     void processInterleavedChannels(const OP_CHOPInput* chopInput, 
                                      float gamma, float brightness,
+                                     bool normalizedInput,
                                      std::vector<uint8_t>& pixelData);
     void processSequentialChannels(const OP_CHOPInput* chopInput,
                                     float gamma, float brightness,
+                                    bool normalizedInput,
                                     std::vector<uint8_t>& pixelData);
     
     // Helper functions
-    uint8_t floatToUint8(float value);
-    float applyGamma(float value, float gamma);
+    uint8_t floatToUint8(float value, bool normalizedInput);
+    float applyGamma(float value, float gamma, bool normalizedInput);
     
     // Socket members
     #ifdef _WIN32

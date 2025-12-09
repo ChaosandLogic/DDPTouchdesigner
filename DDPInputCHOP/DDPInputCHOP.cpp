@@ -131,6 +131,20 @@ void DDPInputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved1
         OP_ParAppendResult res = manager->appendToggle(np);
         assert(res == OP_ParAppendResult::Success);
     }
+    
+    // Value Range (0-1 or 0-255)
+    {
+        OP_StringParameter sp;
+        sp.name = "Valuerange";
+        sp.label = "Value Range";
+        sp.defaultValue = "0-1";
+        
+        const char* names[] = {"0-1", "0-255"};
+        const char* labels[] = {"0-1 (Normalized)", "0-255 (8-bit)"};
+        
+        OP_ParAppendResult res = manager->appendMenu(sp, 2, names, labels);
+        assert(res == OP_ParAppendResult::Success);
+    }
 }
 
 void DDPInputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved1)
@@ -139,6 +153,8 @@ void DDPInputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* r
     int port = inputs->getParInt("Port");
     bool enabled = inputs->getParInt("Enable") != 0;
     bool showStats = inputs->getParInt("Showstats") != 0;
+    const char* valueRange = inputs->getParString("Valuerange");
+    bool normalizedOutput = (strcmp(valueRange, "0-1") == 0);
     
     // Reset stats when toggling
     if (showStats != m_showStats)
@@ -218,7 +234,16 @@ void DDPInputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* r
         int numSamples = static_cast<int>(m_receivedPixelData.size());
         for (int i = 0; i < numSamples && i < output->numSamples; i++)
         {
-            output->channels[4][i] = m_receivedPixelData[i] / 255.0f;
+            if (normalizedOutput)
+            {
+                // Output as 0-1 range
+                output->channels[4][i] = m_receivedPixelData[i] / 255.0f;
+            }
+            else
+            {
+                // Output as 0-255 range (default)
+                output->channels[4][i] = static_cast<float>(m_receivedPixelData[i]);
+            }
         }
     }
 }

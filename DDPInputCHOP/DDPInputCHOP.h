@@ -27,18 +27,23 @@ using namespace TD;
 // DDP Protocol Constants
 #define DDP_PORT 4048
 #define DDP_HEADER_SIZE 10
+#define DDP_HEADER_SIZE_TIMECODE 14
 #define DDP_MAX_DATALEN (480 * 3)
+
+// Upper bound on the reassembled frame buffer; packets addressing beyond this are dropped
+#define DDP_MAX_FRAME_BYTES (1024 * 1024)
+
+// Requested OS socket receive buffer size
+#define DDP_RECV_BUFFER_BYTES (4 * 1024 * 1024)
 
 // DDP Flags
 #define DDP_FLAGS1_VER     0xC0
 #define DDP_FLAGS1_VER1    0x40
 #define DDP_FLAGS1_PUSH    0x01
+#define DDP_FLAGS1_TIME    0x10
 
 // DDP IDs
 #define DDP_ID_DISPLAY  1
-
-// DDP Data Types
-#define DDP_DATA_TYPE_RGB  0x01
 
 class DDPInputCHOP : public CHOP_CPlusPlusBase
 {

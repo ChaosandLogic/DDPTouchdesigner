@@ -348,6 +348,10 @@ void DDPInputCHOP::initializeSocket()
         }
     #endif
     
+    // Packets are only drained once per cook, so a full frame must fit in the OS buffer
+    int rcvBufSize = DDP_RECV_BUFFER_BYTES;
+    setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvBufSize), sizeof(rcvBufSize));
+    
     m_socketInitialized = true;
     m_lastError = "";
 }
@@ -435,7 +439,13 @@ void DDPInputCHOP::receiveData()
             m_lastSourcePort = ntohs(sourceAddr.sin_port);
             
             // Resize buffer if needed
-            size_t requiredSize = offset + dataLen;
+            uint64_t requiredSize = static_cast<uint64_t>(offset) + dataLen;
+            if (requiredSize > DDP_MAX_FRAME_BYTES)
+            {
+                m_lastError = "Dropped packet: offset " + std::to_string(offset) +
+                              " exceeds max frame size of " + std::to_string(DDP_MAX_FRAME_BYTES) + " bytes";
+                continue;
+            }
             if (m_receivedPixelData.size() < requiredSize)
             {
                 m_receivedPixelData.resize(requiredSize, 0);
@@ -460,7 +470,6 @@ bool DDPInputCHOP::parseDDPPacket(const uint8_t* buffer, size_t length,
         return false;
     
     uint8_t flags = buffer[0];
-    uint8_t dataType = buffer[2];
     uint8_t destID = buffer[3];
     
     // Check version
@@ -471,8 +480,11 @@ bool DDPInputCHOP::parseDDPPacket(const uint8_t* buffer, size_t length,
     if (destID != DDP_ID_DISPLAY)
         return false;
     
-    // Only support RGB
-    if (dataType != DDP_DATA_TYPE_RGB)
+    // Data type (byte 2) is not filtered: senders use 0x00, 0x01, 0x0B (RGB24),
+    // 0x1B (RGBW32) etc., and the raw channel bytes are passed through either way.
+    
+    size_t headerSize = (flags & DDP_FLAGS1_TIME) ? DDP_HEADER_SIZE_TIMECODE : DDP_HEADER_SIZE;
+    if (length < headerSize)
         return false;
     
     // Extract offset (big-endian)
@@ -486,13 +498,13 @@ bool DDPInputCHOP::parseDDPPacket(const uint8_t* buffer, size_t length,
               static_cast<uint16_t>(buffer[9]);
     
     // Validate
-    if (dataLen > length - DDP_HEADER_SIZE)
+    if (dataLen > length - headerSize)
         return false;
     
     if (dataLen > DDP_MAX_DATALEN)
         return false;
     
-    pixelData = buffer + DDP_HEADER_SIZE;
+    pixelData = buffer + headerSize;
     
     return true;
 }

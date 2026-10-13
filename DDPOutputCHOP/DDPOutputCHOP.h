@@ -44,10 +44,9 @@ using namespace TD;
 #define DDP_ID_CONFIG   250  // Configuration
 #define DDP_ID_STATUS   251  // Status/discovery
 
-// DDP Data Types
-#define DDP_DATA_TYPE_RGB  0x01
-#define DDP_DATA_TYPE_HSL  0x02
-#define DDP_DATA_TYPE_RGBW 0x03
+// DDP Data Types (byte 2 layout: C R TTT SSS - TTT = type, SSS = bits per element)
+#define DDP_DATA_TYPE_RGB24  0x0B  // RGB, 8 bits per channel
+#define DDP_DATA_TYPE_RGBW32 0x1B  // RGBW, 8 bits per channel
 
 class DDPOutputCHOP : public CHOP_CPlusPlusBase
 {
@@ -75,11 +74,24 @@ private:
     void initializeSocket();
     void closeSocket();
     
+    // One row of the routing table: a slice of the input sent to one controller.
+    // DDP offset for each device starts at 0 (that controller's first pixel).
+    struct DeviceRoute
+    {
+        sockaddr_in addr;
+        size_t byteOffset;
+        size_t byteCount;
+    };
+
     // DDP packet creation and sending
     void createDDPPacket(const uint8_t* pixelData, size_t dataLength, 
                          size_t offset, bool pushFlag, std::vector<uint8_t>& packet);
-    void sendDDPData(const std::vector<uint8_t>& pixelData);
-    void sendPushPacket();
+    void sendDDPData(const uint8_t* pixelData, size_t dataLength, const sockaddr_in& dest, bool autoPush);
+    void sendPushPacketTo(const sockaddr_in& dest);
+
+    // Routing table. Returns false when no table is assigned (single-IP mode).
+    bool parseRoutingTable(const OP_Inputs* inputs, int channelsPerPixel, size_t dataBytes,
+                           std::vector<DeviceRoute>& routes);
     
     // Data processing
     void processInterleavedChannels(const OP_CHOPInput* chopInput, 
@@ -111,10 +123,13 @@ private:
     
     // DDP state
     uint8_t m_sequenceNumber;
+    uint8_t m_dataType;
     int64_t m_packetsSent;
     int64_t m_bytesSent;
     int32_t m_lastChannelCount;
     int32_t m_lastPixelCount;
+    int32_t m_routeCount;
+    std::vector<DeviceRoute> m_routes;
     std::string m_lastError;
     std::string m_lastIPAddress;
     int m_lastPort;
@@ -124,6 +139,7 @@ private:
     bool m_isDiscovering;
     void discoverDevices();
     void sendQueryPacket();
+    void createRoutingTable();
     
     // FPS limiting
     double m_lastFrameTime;

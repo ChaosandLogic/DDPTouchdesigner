@@ -179,7 +179,7 @@ DDPOutputCHOP::DDPOutputCHOP(const OP_NodeInfo* info) : myNodeInfo(info)
     m_socketInitialized = false;
     m_needsReinitialize = false;
     m_sequenceNumber = 0;
-    m_dataType = DDP_DATA_TYPE_RGB24;
+    m_dataType = DDP_DATA_TYPE_UNDEFINED;
     m_packetsSent = 0;
     m_bytesSent = 0;
     m_lastChannelCount = 0;
@@ -978,7 +978,7 @@ void DDPOutputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* 
     double maxFPS = inputs->getParDouble("Maxfps");
     const char* valueRange = inputs->getParString("Valuerange");
     bool normalizedInput = (strcmp(valueRange, "0-1") == 0);
-    m_dataType = (channelsPerPixel == 4) ? DDP_DATA_TYPE_RGBW32 : DDP_DATA_TYPE_RGB24;
+    m_dataType = DDP_DATA_TYPE_UNDEFINED;
     
     // Reset stats when toggling
     if (showStats != m_showStats)

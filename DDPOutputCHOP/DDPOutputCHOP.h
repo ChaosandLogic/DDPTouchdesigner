@@ -44,9 +44,8 @@ using namespace TD;
 #define DDP_ID_CONFIG   250  // Configuration
 #define DDP_ID_STATUS   251  // Status/discovery
 
-// DDP Data Types (byte 2 layout: C R TTT SSS - TTT = type, SSS = bits per element)
-#define DDP_DATA_TYPE_RGB24  0x0B  // RGB, 8 bits per channel
-#define DDP_DATA_TYPE_RGBW32 0x1B  // RGBW, 8 bits per channel
+// Undefined/generic data type: the controller interprets the channel stream.
+#define DDP_DATA_TYPE_UNDEFINED 0x00
 
 class DDPOutputCHOP : public CHOP_CPlusPlusBase
 {

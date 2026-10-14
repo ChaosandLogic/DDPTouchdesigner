@@ -6,7 +6,9 @@
 #include <cctype>
 #include <cstdlib>
 #include <errno.h>
-#ifndef _WIN32
+#ifdef _WIN32
+    #include <psapi.h>
+#else
     #include <dlfcn.h>
 #endif
 
@@ -33,7 +35,7 @@ struct PythonApi
     const char* (*UnicodeAsUTF8)(PyObject*) = nullptr;
     PyObject* (*ObjectStr)(PyObject*) = nullptr;
     PyObject* (*EvalGetBuiltins)() = nullptr;
-    PyObject* (*RunString)(const char*, int, PyObject*, PyObject*) = nullptr;
+    PyObject* (*RunStringFlags)(const char*, int, PyObject*, PyObject*, void*) = nullptr;
     void (*ErrFetch)(PyObject**, PyObject**, PyObject**) = nullptr;
     void (*ErrClear)() = nullptr;
     void (*DecRef)(PyObject*) = nullptr;
@@ -55,6 +57,29 @@ void* findPythonSymbol(const char* name)
         python = GetModuleHandleA("python3.dll");
     for (int minor = 30; !python && minor >= 6; minor--)
         python = GetModuleHandleA(("python3" + std::to_string(minor) + ".dll").c_str());
+
+    // TouchDesigner may host Python in a module whose filename doesn't follow
+    // CPython's usual python3xx.dll convention. macOS dlsym searches every
+    // loaded image, so do the equivalent on Windows before reporting failure.
+    if (!python)
+    {
+        HMODULE modules[1024];
+        DWORD bytesNeeded = 0;
+        if (EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytesNeeded))
+        {
+            const size_t count = std::min(
+                static_cast<size_t>(bytesNeeded / sizeof(HMODULE)),
+                sizeof(modules) / sizeof(modules[0]));
+            for (size_t i = 0; i < count; i++)
+            {
+                if (GetProcAddress(modules[i], "PyGILState_Ensure"))
+                {
+                    python = modules[i];
+                    break;
+                }
+            }
+        }
+    }
     return python ? reinterpret_cast<void*>(GetProcAddress(python, name)) : nullptr;
 #else
     return dlsym(RTLD_DEFAULT, name);
@@ -79,10 +104,16 @@ bool loadPythonApi(PythonApi& py)
     py.TupleGetItem = reinterpret_cast<PyObject* (*)(PyObject*, intptr_t)>(bind("PyTuple_GetItem"));
     py.LongFromLong = reinterpret_cast<PyObject* (*)(long)>(bind("PyLong_FromLong"));
     py.UnicodeFromString = reinterpret_cast<PyObject* (*)(const char*)>(bind("PyUnicode_FromString"));
-    py.UnicodeAsUTF8 = reinterpret_cast<const char* (*)(PyObject*)>(bind("PyUnicode_AsUTF8"));
+    // TouchDesigner's embedded Python on Windows does not always export this
+    // convenience function. It is only used to format exception text, so it
+    // must not prevent the routing-table script from running.
+    py.UnicodeAsUTF8 = reinterpret_cast<const char* (*)(PyObject*)>(findPythonSymbol("PyUnicode_AsUTF8"));
     py.ObjectStr = reinterpret_cast<PyObject* (*)(PyObject*)>(bind("PyObject_Str"));
     py.EvalGetBuiltins = reinterpret_cast<PyObject* (*)()>(bind("PyEval_GetBuiltins"));
-    py.RunString = reinterpret_cast<PyObject* (*)(const char*, int, PyObject*, PyObject*)>(bind("PyRun_String"));
+    // PyRun_String is a macro on Windows; PyRun_StringFlags is the exported
+    // CPython API function. A null flags pointer has the same behavior.
+    py.RunStringFlags = reinterpret_cast<PyObject* (*)(const char*, int, PyObject*, PyObject*, void*)>(
+        bind("PyRun_StringFlags"));
     py.ErrFetch = reinterpret_cast<void (*)(PyObject**, PyObject**, PyObject**)>(bind("PyErr_Fetch"));
     py.ErrClear = reinterpret_cast<void (*)()>(bind("PyErr_Clear"));
     py.DecRef = reinterpret_cast<void (*)(PyObject*)>(bind("Py_DecRef"));
@@ -91,6 +122,12 @@ bool loadPythonApi(PythonApi& py)
 
 std::string pythonExceptionText(PythonApi& py)
 {
+    if (!py.UnicodeAsUTF8)
+    {
+        py.ErrClear();
+        return "Python script failed (exception text is unavailable)";
+    }
+
     PyObject* type = nullptr;
     PyObject* value = nullptr;
     PyObject* trace = nullptr;
@@ -179,6 +216,41 @@ else:
     exec(_body, scope)
 )PY";
 
+// TouchDesigner creates this DAT with each new Custom OP instance. Calling
+// through OP_Context is portable across its macOS and Windows Python hosts;
+// unlike the CPython convenience APIs, it is part of the Custom OP SDK.
+const char* kCallbacksStub = R"PY(# DDP Out callbacks
+
+def onCreateRoutingTable(ddpOut):
+    script = """
+node = args[0]
+parent = node.parent()
+if parent is None:
+    raise RuntimeError('DDP Out has no network to place the routing table in')
+wanted = node.name + '_routing'
+table = None
+try:
+    assigned = node.par.Routingtable.eval()
+    if not isinstance(assigned, str):
+        table = assigned
+except Exception:
+    pass
+if table is None:
+    table = parent.op(wanted)
+if table is None:
+    table = parent.create('tableDAT', wanted)
+    table.nodeX = node.nodeX
+    table.nodeY = node.nodeY - 150
+    table.clear()
+if table.numRows == 0:
+    table.appendRow(['ip', 'pixels', 'port', 'start', 'active'])
+table.dock = node
+node.par.Routingtable = table
+"""
+    run(script, ddpOut, endFrame=True)
+    return ddpOut
+)PY";
+
 std::string lowerCopy(const char* s)
 {
     std::string out = s ? s : "";
@@ -265,7 +337,8 @@ extern "C"
         // Ensure the node cooks on startup (important for output nodes)
         info->customOPInfo.cookOnStart = true;
 
-        info->customOPInfo.minorVersion = 3;
+        info->customOPInfo.pythonCallbacksDAT = kCallbacksStub;
+        info->customOPInfo.minorVersion = 7;
     }
 
     DLLEXPORT CHOP_CPlusPlusBase* CreateCHOPInstance(const OP_NodeInfo* info)
@@ -510,12 +583,23 @@ void DDPOutputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved
         OP_ParAppendResult res = manager->appendPulse(np);
         assert(res == OP_ParAppendResult::Success);
     }
+
+    // Create or assign the routing Table DAT beside this node.
+    {
+        OP_NumericParameter np;
+        np.name = "Createtable";
+        np.label = "Create Routing Table";
+        OP_ParAppendResult res = manager->appendPulse(np);
+        assert(res == OP_ParAppendResult::Success);
+    }
 }
 
 void DDPOutputCHOP::pulsePressed(const char* name, void* reserved1)
 {
     if (strcmp(name, "Discover") == 0)
         discoverDevices();
+    else if (strcmp(name, "Createtable") == 0)
+        createRoutingTable(true);
 }
 
 void DDPOutputCHOP::getErrorString(OP_String* error, void* reserved1)
@@ -526,6 +610,8 @@ void DDPOutputCHOP::getErrorString(OP_String* error, void* reserved1)
 
 void DDPOutputCHOP::createRoutingTable(bool defer)
 {
+    (void)defer;
+
     auto fail = [&](const std::string& message) {
         m_createError = message;
         m_lastError = message;
@@ -537,14 +623,7 @@ void DDPOutputCHOP::createRoutingTable(bool defer)
         return;
     }
 
-    PythonApi py;
-    if (!loadPythonApi(py))
-    {
-        fail(std::string("Create Routing Table: TouchDesigner Python is missing ") + py.missing);
-        return;
-    }
-
-    // First item is the DDP Out operator. TouchDesigner owns the tuple.
+    // The SDK fills item zero with this DDP Out operator.
     PyObject* args = myNodeInfo->context->createArgumentsTuple(0, nullptr);
     if (!args)
     {
@@ -552,58 +631,24 @@ void DDPOutputCHOP::createRoutingTable(bool defer)
         return;
     }
 
-    GilGuard gil(py);
-    py.ErrClear();
+    PyObject* result = myNodeInfo->context->callPythonCallback(
+        "onCreateRoutingTable", args, nullptr, nullptr);
 
-    PyObject* node = py.TupleGetItem(args, 0);
-    PyObject* builtins = py.EvalGetBuiltins();
-    PyObject* globals = (node && builtins) ? py.DictNew() : nullptr;
-    if (!globals)
-    {
-        py.ErrClear();
-        py.DecRef(args);
-        fail("Create Routing Table: could not start a Python script");
-        return;
-    }
-    py.DictSetItemString(globals, "__builtins__", builtins);
-    py.DictSetItemString(globals, "_ddp_node", node);
+    // Reference cleanup is optional only for unusual embedded runtimes that
+    // don't export Py_DecRef. At most a few retry objects are retained there.
+    using DecRefFn = void (*)(PyObject*);
+    DecRefFn decRef = reinterpret_cast<DecRefFn>(findPythonSymbol("Py_DecRef"));
+    if (decRef)
+        decRef(args);
 
-    PyObject* deferFlag = py.LongFromLong(defer ? 1 : 0);
-    if (!deferFlag)
-    {
-        py.ErrClear();
-        py.DecRef(globals);
-        py.DecRef(args);
-        fail("Create Routing Table: could not start a Python script");
-        return;
-    }
-    py.DictSetItemString(globals, "_ddp_defer", deferFlag);
-    py.DecRef(deferFlag);
-
-    PyObject* devices = py.ListNew(0);
-    if (!devices)
-    {
-        py.ErrClear();
-        py.DecRef(globals);
-        py.DecRef(args);
-        fail("Create Routing Table: could not build the device list");
-        return;
-    }
-    py.DictSetItemString(globals, "_ddp_devices", devices);
-    py.DecRef(devices);
-
-    PyObject* result = py.RunString(kCreateRoutingTableScript, kPyFileInput, globals, globals);
     if (!result)
     {
-        fail("Create Routing Table: " + pythonExceptionText(py));
-        py.DecRef(globals);
-        py.DecRef(args);
+        fail("Create Routing Table: callback failed (see Textport)");
         return;
     }
 
-    py.DecRef(result);
-    py.DecRef(globals);
-    py.DecRef(args);
+    if (decRef)
+        decRef(result);
     m_createError.clear();
 }
 

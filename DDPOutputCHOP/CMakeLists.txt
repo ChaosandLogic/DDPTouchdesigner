@@ -18,7 +18,7 @@ add_library(DDPOutputCHOP MODULE ${SOURCES})
 # Platform-specific settings
 if(WIN32)
     # Windows: Link Winsock2
-    target_link_libraries(DDPOutputCHOP ws2_32 psapi)
+    target_link_libraries(DDPOutputCHOP ws2_32)
     
     # Set output to .dll
     set_target_properties(DDPOutputCHOP PROPERTIES

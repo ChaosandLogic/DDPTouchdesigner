@@ -6,9 +6,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <errno.h>
-#ifdef _WIN32
-    #include <psapi.h>
-#else
+#ifndef _WIN32
     #include <dlfcn.h>
 #endif
 
@@ -18,35 +16,13 @@ namespace
 // Python functions are looked up in the already-loaded TouchDesigner runtime instead of
 // linking against Python, so the plugin isn't tied to one Python version.
 // All of these are part of CPython's stable ABI.
-constexpr int kPyFileInput = 257;
-
 struct PythonApi
 {
-    const char* missing = nullptr;
-    int (*GILEnsure)() = nullptr;
-    void (*GILRelease)(int) = nullptr;
-    PyObject* (*DictNew)() = nullptr;
-    int (*DictSetItemString)(PyObject*, const char*, PyObject*) = nullptr;
-    PyObject* (*ListNew)(intptr_t) = nullptr;
-    int (*ListSetItem)(PyObject*, intptr_t, PyObject*) = nullptr;
-    PyObject* (*TupleGetItem)(PyObject*, intptr_t) = nullptr;
-    PyObject* (*LongFromLong)(long) = nullptr;
+    PyObject* (*TupleNew)(intptr_t) = nullptr;
+    int (*TupleSetItem)(PyObject*, intptr_t, PyObject*) = nullptr;
     PyObject* (*UnicodeFromString)(const char*) = nullptr;
-    const char* (*UnicodeAsUTF8)(PyObject*) = nullptr;
-    PyObject* (*ObjectStr)(PyObject*) = nullptr;
-    PyObject* (*EvalGetBuiltins)() = nullptr;
-    PyObject* (*RunStringFlags)(const char*, int, PyObject*, PyObject*, void*) = nullptr;
-    void (*ErrFetch)(PyObject**, PyObject**, PyObject**) = nullptr;
-    void (*ErrClear)() = nullptr;
     void (*DecRef)(PyObject*) = nullptr;
-};
-
-struct GilGuard
-{
-    PythonApi& py;
-    int state;
-    explicit GilGuard(PythonApi& api) : py(api), state(api.GILEnsure()) {}
-    ~GilGuard() { py.GILRelease(state); }
+    PyObject* None = nullptr;
 };
 
 void* findPythonSymbol(const char* name)
@@ -57,29 +33,6 @@ void* findPythonSymbol(const char* name)
         python = GetModuleHandleA("python3.dll");
     for (int minor = 30; !python && minor >= 6; minor--)
         python = GetModuleHandleA(("python3" + std::to_string(minor) + ".dll").c_str());
-
-    // TouchDesigner may host Python in a module whose filename doesn't follow
-    // CPython's usual python3xx.dll convention. macOS dlsym searches every
-    // loaded image, so do the equivalent on Windows before reporting failure.
-    if (!python)
-    {
-        HMODULE modules[1024];
-        DWORD bytesNeeded = 0;
-        if (EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytesNeeded))
-        {
-            const size_t count = std::min(
-                static_cast<size_t>(bytesNeeded / sizeof(HMODULE)),
-                sizeof(modules) / sizeof(modules[0]));
-            for (size_t i = 0; i < count; i++)
-            {
-                if (GetProcAddress(modules[i], "PyGILState_Ensure"))
-                {
-                    python = modules[i];
-                    break;
-                }
-            }
-        }
-    }
     return python ? reinterpret_cast<void*>(GetProcAddress(python, name)) : nullptr;
 #else
     return dlsym(RTLD_DEFAULT, name);
@@ -88,168 +41,37 @@ void* findPythonSymbol(const char* name)
 
 bool loadPythonApi(PythonApi& py)
 {
-    auto bind = [&](const char* name) -> void* {
-        void* symbol = findPythonSymbol(name);
-        if (!symbol && !py.missing)
-            py.missing = name;
-        return symbol;
-    };
-
-    py.GILEnsure = reinterpret_cast<int (*)()>(bind("PyGILState_Ensure"));
-    py.GILRelease = reinterpret_cast<void (*)(int)>(bind("PyGILState_Release"));
-    py.DictNew = reinterpret_cast<PyObject* (*)()>(bind("PyDict_New"));
-    py.DictSetItemString = reinterpret_cast<int (*)(PyObject*, const char*, PyObject*)>(bind("PyDict_SetItemString"));
-    py.ListNew = reinterpret_cast<PyObject* (*)(intptr_t)>(bind("PyList_New"));
-    py.ListSetItem = reinterpret_cast<int (*)(PyObject*, intptr_t, PyObject*)>(bind("PyList_SetItem"));
-    py.TupleGetItem = reinterpret_cast<PyObject* (*)(PyObject*, intptr_t)>(bind("PyTuple_GetItem"));
-    py.LongFromLong = reinterpret_cast<PyObject* (*)(long)>(bind("PyLong_FromLong"));
-    py.UnicodeFromString = reinterpret_cast<PyObject* (*)(const char*)>(bind("PyUnicode_FromString"));
-    // TouchDesigner's embedded Python on Windows does not always export this
-    // convenience function. It is only used to format exception text, so it
-    // must not prevent the routing-table script from running.
-    py.UnicodeAsUTF8 = reinterpret_cast<const char* (*)(PyObject*)>(findPythonSymbol("PyUnicode_AsUTF8"));
-    py.ObjectStr = reinterpret_cast<PyObject* (*)(PyObject*)>(bind("PyObject_Str"));
-    py.EvalGetBuiltins = reinterpret_cast<PyObject* (*)()>(bind("PyEval_GetBuiltins"));
-    // PyRun_String is a macro on Windows; PyRun_StringFlags is the exported
-    // CPython API function. A null flags pointer has the same behavior.
-    py.RunStringFlags = reinterpret_cast<PyObject* (*)(const char*, int, PyObject*, PyObject*, void*)>(
-        bind("PyRun_StringFlags"));
-    py.ErrFetch = reinterpret_cast<void (*)(PyObject**, PyObject**, PyObject**)>(bind("PyErr_Fetch"));
-    py.ErrClear = reinterpret_cast<void (*)()>(bind("PyErr_Clear"));
-    py.DecRef = reinterpret_cast<void (*)(PyObject*)>(bind("Py_DecRef"));
-    return py.missing == nullptr;
+    py.TupleNew = reinterpret_cast<PyObject* (*)(intptr_t)>(findPythonSymbol("PyTuple_New"));
+    py.TupleSetItem = reinterpret_cast<int (*)(PyObject*, intptr_t, PyObject*)>(findPythonSymbol("PyTuple_SetItem"));
+    py.UnicodeFromString = reinterpret_cast<PyObject* (*)(const char*)>(findPythonSymbol("PyUnicode_FromString"));
+    py.DecRef = reinterpret_cast<void (*)(PyObject*)>(findPythonSymbol("Py_DecRef"));
+    py.None = reinterpret_cast<PyObject*>(findPythonSymbol("_Py_NoneStruct"));
+    return py.TupleNew && py.TupleSetItem && py.UnicodeFromString && py.DecRef && py.None;
 }
 
-std::string pythonExceptionText(PythonApi& py)
-{
-    if (!py.UnicodeAsUTF8)
-    {
-        py.ErrClear();
-        return "Python script failed (exception text is unavailable)";
-    }
-
-    PyObject* type = nullptr;
-    PyObject* value = nullptr;
-    PyObject* trace = nullptr;
-    py.ErrFetch(&type, &value, &trace);
-
-    std::string text;
-    if (value)
-    {
-        PyObject* asStr = py.ObjectStr(value);
-        if (asStr)
-        {
-            const char* utf = py.UnicodeAsUTF8(asStr);
-            if (utf)
-                text = utf;
-            py.DecRef(asStr);
-        }
-        else
-        {
-            py.ErrClear();
-        }
-    }
-
-    if (type)
-        py.DecRef(type);
-    if (value)
-        py.DecRef(value);
-    if (trace)
-        py.DecRef(trace);
-    return text.empty() ? std::string("Python error") : text;
-}
-
-// _ddp_node is the DDP Out operator. _ddp_devices is a list of IP strings.
-// _ddp_defer is 1 when this is called from a cook. The DAT is built from a
-// script string at the end of the frame, which is how TouchDesigner runs
-// deferred operator creation. Existing rows are kept. The table is docked.
-const char* kCreateRoutingTableScript = R"PY(
-_body = """
-node = args[0]
-devices = list(args[1])
-parent = node.parent()
-if parent is None:
-    raise RuntimeError('DDP Out has no network to place the routing table in')
-wanted = node.name + '_routing'
-assigned = None
-try:
-    assigned = node.par.Routingtable.eval()
-except Exception:
-    assigned = None
-if isinstance(assigned, str):
-    assigned = parent.op(assigned) if assigned else None
-table = None
-if assigned is not None:
-    docked_to = getattr(assigned, 'dock', None)
-    if docked_to is None or docked_to == node or assigned.name == wanted:
-        table = assigned
-if table is None:
-    table = parent.op(wanted)
-if table is None:
-    try:
-        table = parent.create('tableDAT', wanted)
-    except Exception:
-        import td
-        table = parent.create(td.tableDAT, wanted)
-    table.nodeX = node.nodeX
-    table.nodeY = node.nodeY - 150
-    table.clear()
-if table.numRows == 0:
-    table.appendRow(['ip', 'pixels', 'port', 'start', 'active'])
-known = set()
-if table.numRows > 1:
-    for cell in table.col(0)[1:]:
-        known.add(cell.val)
-for ip in devices:
-    if ip not in known:
-        table.appendRow([ip, '', '', '', 1])
-        known.add(ip)
-table.dock = node
-node.par.Routingtable = table
-"""
-if _ddp_defer:
-    import td
-    td.run(_body, _ddp_node, list(_ddp_devices), endFrame=True)
-else:
-    scope = dict(globals())
-    scope['args'] = (_ddp_node, list(_ddp_devices))
-    exec(_body, scope)
-)PY";
-
-// TouchDesigner creates this DAT with each new Custom OP instance. Calling
-// through OP_Context is portable across its macOS and Windows Python hosts;
-// unlike the CPython convenience APIs, it is part of the Custom OP SDK.
-const char* kCallbacksStub = R"PY(# DDP Out callbacks
-
-def onCreateRoutingTable(ddpOut):
-    script = """
-node = args[0]
-parent = node.parent()
-if parent is None:
-    raise RuntimeError('DDP Out has no network to place the routing table in')
-wanted = node.name + '_routing'
-table = None
-try:
-    assigned = node.par.Routingtable.eval()
-    if not isinstance(assigned, str):
-        table = assigned
-except Exception:
-    pass
-if table is None:
-    table = parent.op(wanted)
-if table is None:
-    table = parent.create('tableDAT', wanted)
-    table.nodeX = node.nodeX
-    table.nodeY = node.nodeY - 150
-    table.clear()
-if table.numRows == 0:
-    table.appendRow(['ip', 'pixels', 'port', 'start', 'active'])
-table.dock = node
-node.par.Routingtable = table
-"""
-    run(script, ddpOut, endFrame=True)
-    return ddpOut
-)PY";
+const char* kCallbacksStub =
+    "# DDP Out callbacks\n"
+    "\n"
+    "def onCreateRoutingTable(ddpOut, devices):\n"
+    "\t\"\"\"Called by Create Routing Table.\n"
+    "\tdevices: tuple of IP strings found by discovery (may be empty).\n"
+    "\tCreates or updates <name>_routing next to the node and assigns it.\n"
+    "\tExisting rows are kept; newly found IPs are appended.\"\"\"\n"
+    "\tname = ddpOut.name + '_routing'\n"
+    "\ttable = ddpOut.parent().op(name)\n"
+    "\tif table is None:\n"
+    "\t\ttable = ddpOut.parent().create(tableDAT, name)\n"
+    "\t\ttable.nodeX = ddpOut.nodeX\n"
+    "\t\ttable.nodeY = ddpOut.nodeY - 200\n"
+    "\t\ttable.clear()\n"
+    "\tif table.numRows == 0:\n"
+    "\t\ttable.appendRow(['ip', 'pixels', 'port', 'start', 'active'])\n"
+    "\tknown = set(c.val for c in table.col(0)[1:])\n"
+    "\tfor ip in devices:\n"
+    "\t\tif ip not in known:\n"
+    "\t\t\ttable.appendRow([ip, '', '', '', 1])\n"
+    "\tddpOut.par.Routingtable = table\n"
+    "\treturn table\n";
 
 std::string lowerCopy(const char* s)
 {
@@ -338,7 +160,7 @@ extern "C"
         info->customOPInfo.cookOnStart = true;
 
         info->customOPInfo.pythonCallbacksDAT = kCallbacksStub;
-        info->customOPInfo.minorVersion = 7;
+        info->customOPInfo.minorVersion = 2;
     }
 
     DLLEXPORT CHOP_CPlusPlusBase* CreateCHOPInstance(const OP_NodeInfo* info)
@@ -357,6 +179,7 @@ DDPOutputCHOP::DDPOutputCHOP(const OP_NodeInfo* info) : myNodeInfo(info)
     m_socketInitialized = false;
     m_needsReinitialize = false;
     m_sequenceNumber = 0;
+    m_dataType = DDP_DATA_TYPE_RGB24;
     m_packetsSent = 0;
     m_bytesSent = 0;
     m_lastChannelCount = 0;
@@ -365,8 +188,6 @@ DDPOutputCHOP::DDPOutputCHOP(const OP_NodeInfo* info) : myNodeInfo(info)
     m_lastPort = 0;
     m_showStats = false;
     m_isDiscovering = false;
-    m_routingTableAttempts = 0;
-    m_routingTableWait = 0;
     m_lastFrameTime = 0.0;
     
     #ifdef _WIN32
@@ -378,13 +199,6 @@ DDPOutputCHOP::DDPOutputCHOP(const OP_NodeInfo* info) : myNodeInfo(info)
     
     memset(&m_destAddr, 0, sizeof(m_destAddr));
     memset(&m_broadcastAddr, 0, sizeof(m_broadcastAddr));
-
-    // Same moment DMX Out creates its routing table: while the node is being
-    // constructed, before it cooks. If the node is not in a network yet, the
-    // first cooks schedule the same script for the end of the frame.
-    createRoutingTable(false);
-    if (!m_createError.empty())
-        m_createError.clear();
 }
 
 DDPOutputCHOP::~DDPOutputCHOP()
@@ -511,17 +325,19 @@ void DDPOutputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved
         assert(res == OP_ParAppendResult::Success);
     }
     
-    // Channels Per Pixel: RGB (3) or RGBW (4), used to turn routing pixel counts into bytes
+    // Channels Per Pixel (4 = RGBW data type in packet header, otherwise RGB)
     {
-        OP_StringParameter sp;
-        sp.name = "Channelsperpixel";
-        sp.label = "Channels Per Pixel";
-        sp.defaultValue = "3";
-
-        const char* names[] = {"3", "4"};
-        const char* labels[] = {"3 (RGB)", "4 (RGBW)"};
-
-        OP_ParAppendResult res = manager->appendMenu(sp, 2, names, labels);
+        OP_NumericParameter np;
+        np.name = "Channelsperpixel";
+        np.label = "Channels Per Pixel";
+        np.defaultValues[0] = 3.0; // RGB default
+        np.minSliders[0] = 1.0;
+        np.maxSliders[0] = 6.0;
+        np.minValues[0] = 1.0;
+        np.maxValues[0] = 10.0;
+        np.clampMins[0] = true;
+        np.clampMaxes[0] = true;
+        OP_ParAppendResult res = manager->appendInt(np);
         assert(res == OP_ParAppendResult::Success);
     }
     
@@ -583,8 +399,8 @@ void DDPOutputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved
         OP_ParAppendResult res = manager->appendPulse(np);
         assert(res == OP_ParAppendResult::Success);
     }
-
-    // Create or assign the routing Table DAT beside this node.
+    
+    // Create Routing Table Button
     {
         OP_NumericParameter np;
         np.name = "Createtable";
@@ -597,59 +413,59 @@ void DDPOutputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved
 void DDPOutputCHOP::pulsePressed(const char* name, void* reserved1)
 {
     if (strcmp(name, "Discover") == 0)
-        discoverDevices();
-    else if (strcmp(name, "Createtable") == 0)
-        createRoutingTable(true);
-}
-
-void DDPOutputCHOP::getErrorString(OP_String* error, void* reserved1)
-{
-    if (!m_createError.empty())
-        error->setString(m_createError.c_str());
-}
-
-void DDPOutputCHOP::createRoutingTable(bool defer)
-{
-    (void)defer;
-
-    auto fail = [&](const std::string& message) {
-        m_createError = message;
-        m_lastError = message;
-    };
-
-    if (!myNodeInfo || !myNodeInfo->context)
     {
-        fail("Create Routing Table: node is not available");
+        discoverDevices();
+    }
+    else if (strcmp(name, "Createtable") == 0)
+    {
+        createRoutingTable();
+    }
+}
+
+void DDPOutputCHOP::createRoutingTable()
+{
+    if (m_socketInitialized)
+        discoverDevices();
+    else
+        m_discoveredDevices.clear();
+
+    PythonApi py;
+    if (!loadPythonApi(py))
+    {
+        m_lastError = "Create Routing Table: TouchDesigner's Python runtime was not found";
         return;
     }
 
-    // The SDK fills item zero with this DDP Out operator.
-    PyObject* args = myNodeInfo->context->createArgumentsTuple(0, nullptr);
+    OP_Context* context = myNodeInfo->context;
+    PyObject* args = context ? context->createArgumentsTuple(1, nullptr) : nullptr;
     if (!args)
     {
-        fail("Create Routing Table: could not reference this operator");
+        m_lastError = "Create Routing Table: could not create Python arguments";
         return;
     }
 
-    PyObject* result = myNodeInfo->context->callPythonCallback(
-        "onCreateRoutingTable", args, nullptr, nullptr);
+    // Discovery records "ip" or "ip:replyport"; the reply port isn't the DDP listen port, so pass IPs only.
+    PyObject* devices = py.TupleNew(static_cast<intptr_t>(m_discoveredDevices.size()));
+    for (size_t i = 0; i < m_discoveredDevices.size(); i++)
+    {
+        std::string ip = m_discoveredDevices[i].substr(0, m_discoveredDevices[i].find(':'));
+        py.TupleSetItem(devices, static_cast<intptr_t>(i), py.UnicodeFromString(ip.c_str()));
+    }
+    py.TupleSetItem(args, 1, devices);
 
-    // Reference cleanup is optional only for unusual embedded runtimes that
-    // don't export Py_DecRef. At most a few retry objects are retained there.
-    using DecRefFn = void (*)(PyObject*);
-    DecRefFn decRef = reinterpret_cast<DecRefFn>(findPythonSymbol("Py_DecRef"));
-    if (decRef)
-        decRef(args);
+    PyObject* result = context->callPythonCallback("onCreateRoutingTable", args, nullptr, nullptr);
+    py.DecRef(args);
 
     if (!result)
     {
-        fail("Create Routing Table: callback failed (see Textport)");
+        m_lastError = "Create Routing Table: onCreateRoutingTable raised an error (see Textport)";
         return;
     }
-
-    if (decRef)
-        decRef(result);
-    m_createError.clear();
+    if (result == py.None)
+        m_lastError = "Create Routing Table: no Callbacks DAT with onCreateRoutingTable() is set";
+    else
+        m_lastError = "Routing table created with " + std::to_string(m_discoveredDevices.size()) + " discovered device(s)";
+    py.DecRef(result);
 }
 
 void DDPOutputCHOP::initializeSocket()
@@ -770,8 +586,8 @@ void DDPOutputCHOP::createDDPPacket(const uint8_t* pixelData, size_t dataLength,
     // Byte 1: Sequence number (lower 4 bits)
     packet[1] = m_sequenceNumber & 0x0F;
     
-    // Byte 2: Data type (undefined; receivers treat the payload as raw bytes)
-    packet[2] = DDP_DATA_TYPE_UNDEFINED;
+    // Byte 2: Data type
+    packet[2] = m_dataType;
     
     // Byte 3: Destination ID (Display)
     packet[3] = DDP_ID_DISPLAY;
@@ -852,7 +668,7 @@ void DDPOutputCHOP::sendPushPacketTo(const sockaddr_in& dest)
     
     packet[0] = DDP_FLAGS1_VER1 | DDP_FLAGS1_PUSH;
     packet[1] = m_sequenceNumber & 0x0F;
-    packet[2] = DDP_DATA_TYPE_UNDEFINED;
+    packet[2] = m_dataType;
     packet[3] = DDP_ID_DISPLAY;
     packet[4] = 0;
     packet[5] = 0;
@@ -1036,9 +852,6 @@ bool DDPOutputCHOP::parseRoutingTable(const OP_Inputs* inputs, int channelsPerPi
             m_lastError = "Routing table needs an ip column";
             return true;
         }
-        // Header only: keep sending the whole input to IP Address.
-        if (firstRow >= table->numRows)
-            return false;
     }
     else if (table->numCols < 2)
     {
@@ -1153,36 +966,19 @@ bool DDPOutputCHOP::parseRoutingTable(const OP_Inputs* inputs, int channelsPerPi
 
 void DDPOutputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved1)
 {
-    // Creating a DAT during this cook is not allowed, so schedule it for the
-    // end of the frame. That still runs while the timeline is stopped.
-    // Retry a few times in case the node was not in the network yet.
-    if (!inputs->getParDAT("Routingtable") && m_routingTableAttempts < 8)
-    {
-        if (m_routingTableWait <= 0)
-        {
-            m_routingTableAttempts++;
-            m_routingTableWait = 3;
-            createRoutingTable(true);
-        }
-        else
-        {
-            m_routingTableWait--;
-        }
-    }
-
     // Get parameters
     const char* ipAddress = inputs->getParString("Ipaddress");
     int port = inputs->getParInt("Port");
     bool enabled = inputs->getParInt("Enable") != 0;
     float gamma = static_cast<float>(inputs->getParDouble("Gamma"));
     float brightness = static_cast<float>(inputs->getParDouble("Brightness"));
-    const char* channelsPerPixelName = inputs->getParString("Channelsperpixel");
-    int channelsPerPixel = (channelsPerPixelName && std::strcmp(channelsPerPixelName, "4") == 0) ? 4 : 3;
+    int channelsPerPixel = inputs->getParInt("Channelsperpixel");
     bool autoPush = inputs->getParInt("Autopush") != 0;
     bool showStats = inputs->getParInt("Showstats") != 0;
     double maxFPS = inputs->getParDouble("Maxfps");
     const char* valueRange = inputs->getParString("Valuerange");
     bool normalizedInput = (strcmp(valueRange, "0-1") == 0);
+    m_dataType = (channelsPerPixel == 4) ? DDP_DATA_TYPE_RGBW32 : DDP_DATA_TYPE_RGB24;
     
     // Reset stats when toggling
     if (showStats != m_showStats)
@@ -1395,7 +1191,7 @@ void DDPOutputCHOP::sendQueryPacket()
     // Header
     packet[0] = DDP_FLAGS1_VER1 | 0x02;  // VER1 + QUERY flag
     packet[1] = 0;                        // Sequence 0
-    packet[2] = DDP_DATA_TYPE_UNDEFINED;  // Data type (ignored for query)
+    packet[2] = 0x00;                     // Data type (ignored for query)
     packet[3] = DDP_ID_STATUS;            // STATUS destination (251)
     packet[4] = 0;                        // Offset (all zeros)
     packet[5] = 0;

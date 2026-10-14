@@ -18,21 +18,18 @@ Send pixel data to LED controllers.
 
 | Parameter | Description |
 |-----------|-------------|
-| IP Address | Controller IP. Used when Routing Table is empty |
+| IP Address | Controller IP. Used when the routing table has no device rows |
 | Port | DDP port (default: 4048). Default for table rows that leave port blank |
-| Routing Table | Optional table DAT. Each row sends a pixel slice to an IP |
+| Routing Table | Table DAT docked to this node. Created automatically. Each row sends a pixel slice to an IP |
 | Enable | Toggle output |
 | Gamma | Gamma correction (1.0 = none) |
 | Brightness | Master brightness (0-1) |
 | Value Range | Input format: 0-1 (default) or 0-255 |
-| Channels Per Pixel | 3 = RGB, 4 = RGBW (sets the DDP data type receivers like WLED use) |
+| Channels Per Pixel | RGB (3) or RGBW (4). Used to turn routing-table pixel counts into bytes. Packet data type is left undefined (0) |
 | Auto Push | One device: PUSH on the last packet. Several devices: data first, then a PUSH to each controller |
 | Discover Devices | Broadcast a DDP query and list responding devices in the Info DAT |
-| Create Routing Table | Run discovery, then create `<name>_routing` next to the node with any found IPs and assign it to Routing Table. Pressing it again keeps your rows and appends new IPs |
 
-Create Routing Table uses the node's Callbacks DAT (`onCreateRoutingTable`), which TouchDesigner creates from the plugin's template. Nodes created before this version won't have it. Recreate the node to get it.
-
-Leave Routing Table empty to send the whole input to IP Address. Otherwise use a Table DAT:
+A new DDP Out node creates `<name>_routing`, docks it to the node, and assigns it to Routing Table. Until that table has a device row, the whole input still goes to IP Address.
 
 ```
 ip              pixels    port    start    active

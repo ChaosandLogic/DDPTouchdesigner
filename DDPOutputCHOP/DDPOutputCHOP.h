@@ -44,9 +44,8 @@ using namespace TD;
 #define DDP_ID_CONFIG   250  // Configuration
 #define DDP_ID_STATUS   251  // Status/discovery
 
-// DDP Data Types (byte 2 layout: C R TTT SSS - TTT = type, SSS = bits per element)
-#define DDP_DATA_TYPE_RGB24  0x0B  // RGB, 8 bits per channel
-#define DDP_DATA_TYPE_RGBW32 0x1B  // RGBW, 8 bits per channel
+// DDP Data Type (byte 2: C R TTT SSS). 0 = unused / undefined.
+#define DDP_DATA_TYPE_UNDEFINED 0x00
 
 class DDPOutputCHOP : public CHOP_CPlusPlusBase
 {
@@ -68,6 +67,7 @@ public:
     
     virtual void setupParameters(OP_ParameterManager* manager, void* reserved1) override;
     virtual void pulsePressed(const char* name, void* reserved1) override;
+    virtual void getErrorString(OP_String* error, void* reserved1) override;
 
 private:
     // Socket management
@@ -123,7 +123,6 @@ private:
     
     // DDP state
     uint8_t m_sequenceNumber;
-    uint8_t m_dataType;
     int64_t m_packetsSent;
     int64_t m_bytesSent;
     int32_t m_lastChannelCount;
@@ -131,6 +130,7 @@ private:
     int32_t m_routeCount;
     std::vector<DeviceRoute> m_routes;
     std::string m_lastError;
+    std::string m_createError;
     std::string m_lastIPAddress;
     int m_lastPort;
     
@@ -139,7 +139,10 @@ private:
     bool m_isDiscovering;
     void discoverDevices();
     void sendQueryPacket();
-    void createRoutingTable();
+    // defer waits until after the current cook.
+    void createRoutingTable(bool defer);
+    int m_routingTableAttempts;
+    int m_routingTableWait;
     
     // FPS limiting
     double m_lastFrameTime;

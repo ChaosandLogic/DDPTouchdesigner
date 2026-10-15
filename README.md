@@ -26,7 +26,7 @@ Send pixel data to LED controllers.
 | Brightness | Master brightness (0-1) |
 | Value Range | Input format: 0-1 (default) or 0-255 |
 | Channels Per Pixel | 3 = RGB, 4 = RGBW (sets the DDP data type receivers like WLED use) |
-| Auto Push | One device: PUSH on the last packet. Several devices: data first, then a PUSH to each controller |
+| Auto Push | PUSH flag on the last data packet to each controller |
 | Discover Devices | Broadcast a DDP query and list responding devices in the Info DAT |
 | Create Routing Table | Run discovery, then create `<name>_routing` next to the node with any found IPs and assign it to Routing Table. Pressing it again keeps your rows and appends new IPs |
 

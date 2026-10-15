@@ -7,12 +7,19 @@
     #define NOMINMAX  // Prevent Windows from defining min/max macros
     #include <winsock2.h>
     #include <ws2tcpip.h>
+    #include <mmsystem.h>
     #pragma comment(lib, "ws2_32.lib")
+    #pragma comment(lib, "winmm.lib")
 #endif
 
 #include "CHOP_CPlusPlusBase.h"
 #include <vector>
 #include <string>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 using namespace TD;
 
@@ -46,6 +53,14 @@ using namespace TD;
 
 // Undefined/generic data type: the controller interprets the channel stream.
 #define DDP_DATA_TYPE_UNDEFINED 0x00
+
+// Requested socket send buffer. The OS default is too small for a whole frame of packets.
+#define DDP_SEND_BUFFER_BYTES (4 * 1024 * 1024)
+
+// Packet pacing: spread a frame's packets over this fraction of the frame interval,
+// but never longer than DDP_PACING_MAX_WINDOW_SEC, so latency stays low at low frame rates.
+#define DDP_PACING_WINDOW_FRACTION 0.75
+#define DDP_PACING_MAX_WINDOW_SEC 0.030
 
 class DDPOutputCHOP : public CHOP_CPlusPlusBase
 {
@@ -82,11 +97,25 @@ private:
         size_t byteCount;
     };
 
-    // DDP packet creation and sending
+    // One frame handed from execute() to the sender thread.
+    struct SendFrame
+    {
+        std::vector<uint8_t> pixels;
+        std::vector<DeviceRoute> routes;
+        bool autoPush = true;
+        double pacingWindowSec = 0.0;  // 0 = send as one burst
+    };
+
+    // DDP packet creation and sending (sender thread only, socket mutex held)
     void createDDPPacket(const uint8_t* pixelData, size_t dataLength, 
                          size_t offset, bool pushFlag, std::vector<uint8_t>& packet);
-    void sendDDPData(const uint8_t* pixelData, size_t dataLength, const sockaddr_in& dest, bool autoPush);
+    void sendPacket(const std::vector<uint8_t>& packet, const sockaddr_in& dest);
     void sendPushPacketTo(const sockaddr_in& dest);
+    void sendFrame(const SendFrame& frame);
+
+    // Sender thread
+    void senderLoop();
+    void submitFrame(std::vector<DeviceRoute>& routes, bool autoPush);
 
     // Routing table. Returns false when no table is assigned (single-IP mode).
     bool parseRoutingTable(const OP_Inputs* inputs, int channelsPerPixel, size_t dataBytes,
@@ -116,15 +145,32 @@ private:
     
     struct sockaddr_in m_destAddr;
     struct sockaddr_in m_broadcastAddr;
-    bool m_socketInitialized;
+    std::atomic<bool> m_socketInitialized;
     bool m_needsReinitialize;
-    bool m_showStats;
+    std::atomic<bool> m_showStats;
+
+    // Guards m_socket while the sender thread or discovery is using it.
+    std::mutex m_socketMutex;
     
     // DDP state
     uint8_t m_sequenceNumber;
-    uint8_t m_dataType;
-    int64_t m_packetsSent;
-    int64_t m_bytesSent;
+    std::atomic<uint8_t> m_dataType;
+    std::atomic<int64_t> m_packetsSent;
+    std::atomic<int64_t> m_bytesSent;
+    std::atomic<int> m_lastSendError;
+    std::vector<uint8_t> m_packetBuffer;
+
+    // Sender thread hand-off. Only the newest pending frame is kept.
+    std::thread m_senderThread;
+    std::mutex m_frameMutex;
+    std::condition_variable m_frameCv;
+    SendFrame m_pendingFrame;
+    bool m_hasPendingFrame;
+    bool m_stopSender;
+    int64_t m_framesDropped;
+    std::vector<uint8_t> m_workPixels;
+    std::chrono::steady_clock::time_point m_lastSubmitTime;
+    double m_frameIntervalSec;
     int32_t m_lastChannelCount;
     int32_t m_lastPixelCount;
     int32_t m_routeCount;

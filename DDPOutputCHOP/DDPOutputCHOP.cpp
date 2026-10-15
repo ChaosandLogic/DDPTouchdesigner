@@ -189,6 +189,11 @@ DDPOutputCHOP::DDPOutputCHOP(const OP_NodeInfo* info) : myNodeInfo(info)
     m_showStats = false;
     m_isDiscovering = false;
     m_lastFrameTime = 0.0;
+    m_lastSendError = 0;
+    m_hasPendingFrame = false;
+    m_stopSender = false;
+    m_framesDropped = 0;
+    m_frameIntervalSec = 1.0 / 60.0;
     
     #ifdef _WIN32
         m_socket = INVALID_SOCKET;
@@ -199,10 +204,20 @@ DDPOutputCHOP::DDPOutputCHOP(const OP_NodeInfo* info) : myNodeInfo(info)
     
     memset(&m_destAddr, 0, sizeof(m_destAddr));
     memset(&m_broadcastAddr, 0, sizeof(m_broadcastAddr));
+
+    m_senderThread = std::thread(&DDPOutputCHOP::senderLoop, this);
 }
 
 DDPOutputCHOP::~DDPOutputCHOP()
 {
+    {
+        std::lock_guard<std::mutex> lock(m_frameMutex);
+        m_stopSender = true;
+    }
+    m_frameCv.notify_all();
+    if (m_senderThread.joinable())
+        m_senderThread.join();
+
     closeSocket();
 }
 
@@ -390,7 +405,7 @@ void DDPOutputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved
         OP_ParAppendResult res = manager->appendFloat(np);
         assert(res == OP_ParAppendResult::Success);
     }
-    
+
     // Discover Devices Button
     {
         OP_NumericParameter np;
@@ -470,8 +485,11 @@ void DDPOutputCHOP::createRoutingTable()
 
 void DDPOutputCHOP::initializeSocket()
 {
+    std::lock_guard<std::mutex> lock(m_socketMutex);
     if (m_socketInitialized)
         return;
+
+    int sendBufferBytes = DDP_SEND_BUFFER_BYTES;
     
     #ifdef _WIN32
     if (!m_wsaInitialized)
@@ -500,6 +518,8 @@ void DDPOutputCHOP::initializeSocket()
     // Enable broadcast
     BOOL broadcastEnable = TRUE;
     setsockopt(m_socket, SOL_SOCKET, SO_BROADCAST, (char*)&broadcastEnable, sizeof(broadcastEnable));
+
+    setsockopt(m_socket, SOL_SOCKET, SO_SNDBUF, (char*)&sendBufferBytes, sizeof(sendBufferBytes));
     
     // Bind to any local address on DDP port to receive broadcast responses
     struct sockaddr_in localAddr;
@@ -532,6 +552,8 @@ void DDPOutputCHOP::initializeSocket()
     // Enable broadcast
     int broadcastEnable = 1;
     setsockopt(m_socket, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
+
+    setsockopt(m_socket, SOL_SOCKET, SO_SNDBUF, &sendBufferBytes, sizeof(sendBufferBytes));
     
     // Bind to any local address on DDP port to receive broadcast responses
     struct sockaddr_in localAddr;
@@ -556,6 +578,7 @@ void DDPOutputCHOP::initializeSocket()
 
 void DDPOutputCHOP::closeSocket()
 {
+    std::lock_guard<std::mutex> lock(m_socketMutex);
     if (m_socketInitialized)
     {
         #ifdef _WIN32
@@ -583,8 +606,9 @@ void DDPOutputCHOP::createDDPPacket(const uint8_t* pixelData, size_t dataLength,
     if (pushFlag)
         packet[0] |= DDP_FLAGS1_PUSH;
     
-    // Byte 1: Sequence number (lower 4 bits)
-    packet[1] = m_sequenceNumber & 0x0F;
+    // Byte 1: Sequence number. 0 = unused (DDP spec). Non-zero values trip WLED's
+    // "skip out-of-sequence" filter on larger frames and cause flicker.
+    packet[1] = 0;
     
     // Byte 2: Data type
     packet[2] = m_dataType;
@@ -606,91 +630,137 @@ void DDPOutputCHOP::createDDPPacket(const uint8_t* pixelData, size_t dataLength,
     
     // Copy pixel data
     std::memcpy(&packet[DDP_HEADER_SIZE], pixelData, dataLength);
-    
-    // Increment sequence number (wraps at 16)
-    m_sequenceNumber = (m_sequenceNumber + 1) & 0x0F;
 }
 
-void DDPOutputCHOP::sendDDPData(const uint8_t* pixelData, size_t totalBytes, const sockaddr_in& dest, bool autoPush)
+void DDPOutputCHOP::sendPacket(const std::vector<uint8_t>& packet, const sockaddr_in& dest)
 {
-    if (!m_socketInitialized || !pixelData || totalBytes == 0)
-        return;
-    
-    size_t bytesSent = 0;
-    
-    while (bytesSent < totalBytes)
-    {
-        size_t bytesRemaining = totalBytes - bytesSent;
-        size_t bytesInPacket = std::min(bytesRemaining, static_cast<size_t>(DDP_MAX_DATALEN));
-        
-        // Only push on last packet if auto-push is enabled.
-        // Multi-device sends pass autoPush false and follow with a separate PUSH.
-        bool isLastPacket = (bytesSent + bytesInPacket >= totalBytes);
-        bool pushFlag = autoPush && isLastPacket;
-        
-        std::vector<uint8_t> packet;
-        createDDPPacket(pixelData + bytesSent, bytesInPacket, bytesSent, pushFlag, packet);
-        
-        int sendResult = sendto(m_socket, 
-                               reinterpret_cast<const char*>(packet.data()), 
-                               static_cast<int>(packet.size()), 
-                               0,
-                               reinterpret_cast<const struct sockaddr*>(&dest), 
-                               sizeof(dest));
-        
-        if (sendResult > 0 && m_showStats)
-        {
-            m_packetsSent++;
-            m_bytesSent += sendResult;
-        }
-        else if (sendResult < 0)
-        {
-            #ifdef _WIN32
-                int error = WSAGetLastError();
-                m_lastError = "Send failed with error: " + std::to_string(error);
-            #else
-                int error = errno;
-                m_lastError = "Send failed with errno " + std::to_string(error) + ": " + strerror(error);
-            #endif
-        }
-        
-        bytesSent += bytesInPacket;
-    }
-}
-
-void DDPOutputCHOP::sendPushPacketTo(const sockaddr_in& dest)
-{
-    if (!m_socketInitialized)
-        return;
-    
-    // Create a PUSH packet with no data (just header)
-    std::vector<uint8_t> packet(DDP_HEADER_SIZE);
-    
-    packet[0] = DDP_FLAGS1_VER1 | DDP_FLAGS1_PUSH;
-    packet[1] = m_sequenceNumber & 0x0F;
-    packet[2] = m_dataType;
-    packet[3] = DDP_ID_DISPLAY;
-    packet[4] = 0;
-    packet[5] = 0;
-    packet[6] = 0;
-    packet[7] = 0;
-    packet[8] = 0;  // Zero length
-    packet[9] = 0;
-    
     int sendResult = sendto(m_socket,
                            reinterpret_cast<const char*>(packet.data()),
                            static_cast<int>(packet.size()),
                            0,
                            reinterpret_cast<const struct sockaddr*>(&dest),
                            sizeof(dest));
-    
+
     if (sendResult > 0 && m_showStats)
     {
         m_packetsSent++;
         m_bytesSent += sendResult;
     }
-    
-    m_sequenceNumber = (m_sequenceNumber + 1) & 0x0F;
+    else if (sendResult < 0)
+    {
+        #ifdef _WIN32
+            m_lastSendError = WSAGetLastError();
+        #else
+            m_lastSendError = errno;
+        #endif
+    }
+}
+
+void DDPOutputCHOP::sendPushPacketTo(const sockaddr_in& dest)
+{
+    // PUSH packet with no data (just header). Sequence 0 = unused.
+    m_packetBuffer.assign(DDP_HEADER_SIZE, 0);
+    m_packetBuffer[0] = DDP_FLAGS1_VER1 | DDP_FLAGS1_PUSH;
+    m_packetBuffer[1] = 0;
+    m_packetBuffer[2] = m_dataType;
+    m_packetBuffer[3] = DDP_ID_DISPLAY;
+
+    sendPacket(m_packetBuffer, dest);
+}
+
+void DDPOutputCHOP::sendFrame(const SendFrame& frame)
+{
+    std::lock_guard<std::mutex> lock(m_socketMutex);
+    if (!m_socketInitialized || frame.pixels.empty() || frame.routes.empty())
+        return;
+
+    using Clock = std::chrono::steady_clock;
+
+    // Pace between controllers, not between packets to the same one.
+    // Spreading one device's packets over tens of ms makes partial-frame flashes
+    // much more likely if the receiver updates before it has seen a PUSH.
+    const size_t routeCount = frame.routes.size();
+    const bool paceRoutes = frame.pacingWindowSec > 0.0 && routeCount > 1;
+    const Clock::time_point start = Clock::now();
+    const Clock::duration window = std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(frame.pacingWindowSec));
+
+    for (size_t routeIndex = 0; routeIndex < routeCount; routeIndex++)
+    {
+        if (paceRoutes)
+        {
+            Clock::time_point due = start + window * static_cast<Clock::rep>(routeIndex)
+                / static_cast<Clock::rep>(routeCount);
+            if (due - Clock::now() >= std::chrono::milliseconds(1))
+                std::this_thread::sleep_until(due);
+        }
+
+        const DeviceRoute& route = frame.routes[routeIndex];
+        const uint8_t* data = frame.pixels.data() + route.byteOffset;
+        size_t bytesSent = 0;
+
+        // Each controller gets a tight burst, with PUSH on its last data packet.
+        // Empty PUSH packets are easy to lose and leave the display frozen or flashing.
+        while (bytesSent < route.byteCount)
+        {
+            size_t bytesInPacket = std::min(route.byteCount - bytesSent, static_cast<size_t>(DDP_MAX_DATALEN));
+            bool isLastPacket = (bytesSent + bytesInPacket >= route.byteCount);
+            createDDPPacket(data + bytesSent, bytesInPacket, bytesSent,
+                            frame.autoPush && isLastPacket, m_packetBuffer);
+            sendPacket(m_packetBuffer, route.addr);
+            bytesSent += bytesInPacket;
+        }
+    }
+}
+
+void DDPOutputCHOP::senderLoop()
+{
+    #ifdef _WIN32
+        // 1 ms sleep resolution for pacing; the default is ~15.6 ms.
+        timeBeginPeriod(1);
+    #endif
+
+    SendFrame frame;
+    while (true)
+    {
+        {
+            std::unique_lock<std::mutex> lock(m_frameMutex);
+            m_frameCv.wait(lock, [this] { return m_stopSender || m_hasPendingFrame; });
+            if (m_stopSender)
+                break;
+            std::swap(frame, m_pendingFrame);
+            m_hasPendingFrame = false;
+        }
+        sendFrame(frame);
+    }
+
+    #ifdef _WIN32
+        timeEndPeriod(1);
+    #endif
+}
+
+void DDPOutputCHOP::submitFrame(std::vector<DeviceRoute>& routes, bool autoPush)
+{
+    auto now = std::chrono::steady_clock::now();
+    double interval = std::chrono::duration<double>(now - m_lastSubmitTime).count();
+    m_lastSubmitTime = now;
+    if (interval > 0.0 && interval < 1.0)
+        m_frameIntervalSec = 0.8 * m_frameIntervalSec + 0.2 * interval;
+
+    double window = std::min(m_frameIntervalSec * DDP_PACING_WINDOW_FRACTION, DDP_PACING_MAX_WINDOW_SEC);
+
+    {
+        std::lock_guard<std::mutex> lock(m_frameMutex);
+        if (m_hasPendingFrame)
+            m_framesDropped++;
+        // Swap so both buffers keep their capacity and nothing is reallocated per frame.
+        std::swap(m_pendingFrame.pixels, m_workPixels);
+        std::swap(m_pendingFrame.routes, routes);
+        m_pendingFrame.autoPush = autoPush;
+        m_pendingFrame.pacingWindowSec = window;
+        m_hasPendingFrame = true;
+    }
+    m_frameCv.notify_one();
 }
 
 uint8_t DDPOutputCHOP::floatToUint8(float value, bool normalizedInput)
@@ -987,6 +1057,16 @@ void DDPOutputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* 
         m_bytesSent = 0;
     }
     m_showStats = showStats;
+
+    int sendError = m_lastSendError.exchange(0);
+    if (sendError != 0)
+    {
+        #ifdef _WIN32
+            m_lastError = "Send failed with error: " + std::to_string(sendError);
+        #else
+            m_lastError = "Send failed with errno " + std::to_string(sendError) + ": " + strerror(sendError);
+        #endif
+    }
     
     // Output status channels
     output->channels[0][0] = enabled ? 1.0f : 0.0f;
@@ -1045,41 +1125,36 @@ void DDPOutputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* 
     // Process channel data (expects 1 channel with samples)
     // Like DMX Out: agnostic to format (RGB, RGBW, or any channel count)
     // Examples: r0,g0,b0,r1,g1,b1... or r0,g0,b0,w0,r1,g1,b1,w1...
-    std::vector<uint8_t> pixelData;
-    processInterleavedChannels(chopInput, gamma, brightness, normalizedInput, pixelData);
+    m_workPixels.clear();
+    processInterleavedChannels(chopInput, gamma, brightness, normalizedInput, m_workPixels);
     
     // Update channel and pixel counts
-    m_lastChannelCount = static_cast<int32_t>(pixelData.size());
+    m_lastChannelCount = static_cast<int32_t>(m_workPixels.size());
     m_lastPixelCount = (channelsPerPixel > 0) ? (m_lastChannelCount / channelsPerPixel) : 0;
     
-    // Send DDP packets if we have data.
+    // Hand the frame to the sender thread if we have data.
     // A routing table slices the stream across controllers. With no table,
     // the whole input still goes to IP Address.
-    if (!pixelData.empty())
+    if (!m_workPixels.empty())
     {
         std::vector<DeviceRoute> routes;
-        bool usingTable = parseRoutingTable(inputs, channelsPerPixel, pixelData.size(), routes);
+        bool usingTable = parseRoutingTable(inputs, channelsPerPixel, m_workPixels.size(), routes);
         if (usingTable)
         {
             m_routes = routes;
             m_routeCount = static_cast<int32_t>(routes.size());
-            bool multi = routes.size() > 1;
-            for (const DeviceRoute& route : routes)
-                sendDDPData(pixelData.data() + route.byteOffset, route.byteCount, route.addr, autoPush && !multi);
-
-            // Latch every controller together after the data is buffered.
-            if (autoPush && multi)
-            {
-                for (const DeviceRoute& route : routes)
-                    sendPushPacketTo(route.addr);
-            }
         }
         else
         {
             m_routes.clear();
             m_routeCount = 1;
-            sendDDPData(pixelData.data(), pixelData.size(), m_destAddr, autoPush);
+            DeviceRoute route;
+            route.addr = m_destAddr;
+            route.byteOffset = 0;
+            route.byteCount = m_workPixels.size();
+            routes.push_back(route);
         }
+        submitFrame(routes, autoPush);
     }
 
     output->channels[1][0] = static_cast<float>(m_packetsSent);
@@ -1123,7 +1198,7 @@ void DDPOutputCHOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void* 
 
 bool DDPOutputCHOP::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1)
 {
-    infoSize->rows = 8 + static_cast<int32_t>(m_discoveredDevices.size());
+    infoSize->rows = 9 + static_cast<int32_t>(m_discoveredDevices.size());
     infoSize->cols = 2;
     infoSize->byColumn = false;
     return true;
@@ -1135,12 +1210,12 @@ void DDPOutputCHOP::getInfoDATEntries(int32_t index, int32_t nEntries,
     if (index == 0)
     {
         entries->values[0]->setString("Packets Sent");
-        entries->values[1]->setString(std::to_string(m_packetsSent).c_str());
+        entries->values[1]->setString(std::to_string(m_packetsSent.load()).c_str());
     }
     else if (index == 1)
     {
         entries->values[0]->setString("Bytes Sent");
-        entries->values[1]->setString(std::to_string(m_bytesSent).c_str());
+        entries->values[1]->setString(std::to_string(m_bytesSent.load()).c_str());
     }
     else if (index == 2)
     {
@@ -1172,9 +1247,20 @@ void DDPOutputCHOP::getInfoDATEntries(int32_t index, int32_t nEntries,
         entries->values[0]->setString("Devices Found");
         entries->values[1]->setString(std::to_string(m_discoveredDevices.size()).c_str());
     }
-    else if (index >= 8 && index < 8 + static_cast<int32_t>(m_discoveredDevices.size()))
+    else if (index == 8)
     {
-        int deviceIdx = index - 8;
+        // Frames replaced before the sender thread got to them (network can't keep up).
+        int64_t dropped;
+        {
+            std::lock_guard<std::mutex> lock(m_frameMutex);
+            dropped = m_framesDropped;
+        }
+        entries->values[0]->setString("Frames Dropped");
+        entries->values[1]->setString(std::to_string(dropped).c_str());
+    }
+    else if (index >= 9 && index < 9 + static_cast<int32_t>(m_discoveredDevices.size()))
+    {
+        int deviceIdx = index - 9;
         entries->values[0]->setString(("Device " + std::to_string(deviceIdx + 1)).c_str());
         entries->values[1]->setString(m_discoveredDevices[deviceIdx].c_str());
     }
@@ -1244,6 +1330,9 @@ void DDPOutputCHOP::discoverDevices()
         m_lastError = "Socket not initialized. Enable output first.";
         return;
     }
+
+    // Keep the sender thread off the socket while it's switched to non-blocking.
+    std::lock_guard<std::mutex> lock(m_socketMutex);
     
     // Clear previous discoveries
     m_discoveredDevices.clear();

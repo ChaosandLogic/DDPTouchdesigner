@@ -15,10 +15,14 @@ set(SOURCES
 # Create MODULE library (plugin)
 add_library(DDPOutputCHOP MODULE ${SOURCES})
 
+# Packets are sent from a background thread
+find_package(Threads REQUIRED)
+target_link_libraries(DDPOutputCHOP Threads::Threads)
+
 # Platform-specific settings
 if(WIN32)
-    # Windows: Link Winsock2
-    target_link_libraries(DDPOutputCHOP ws2_32)
+    # Windows: Link Winsock2, and winmm for timeBeginPeriod (1 ms pacing resolution)
+    target_link_libraries(DDPOutputCHOP ws2_32 winmm)
     
     # Set output to .dll
     set_target_properties(DDPOutputCHOP PROPERTIES

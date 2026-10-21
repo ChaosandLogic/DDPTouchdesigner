@@ -21,8 +21,8 @@ target_link_libraries(DDPOutputCHOP Threads::Threads)
 
 # Platform-specific settings
 if(WIN32)
-    # Windows: Link Winsock2, and winmm for timeBeginPeriod (1 ms pacing resolution)
-    target_link_libraries(DDPOutputCHOP ws2_32 winmm)
+    # Windows: Winsock2, iphlpapi (discovery adapters), winmm (1 ms pacing)
+    target_link_libraries(DDPOutputCHOP ws2_32 iphlpapi winmm)
     
     # Set output to .dll
     set_target_properties(DDPOutputCHOP PROPERTIES

@@ -7,8 +7,10 @@
     #define NOMINMAX  // Prevent Windows from defining min/max macros
     #include <winsock2.h>
     #include <ws2tcpip.h>
+    #include <iphlpapi.h>
     #include <mmsystem.h>
     #pragma comment(lib, "ws2_32.lib")
+    #pragma comment(lib, "iphlpapi.lib")
     #pragma comment(lib, "winmm.lib")
 #endif
 
@@ -61,6 +63,11 @@ using namespace TD;
 // but never longer than DDP_PACING_MAX_WINDOW_SEC, so latency stays low at low frame rates.
 #define DDP_PACING_WINDOW_FRACTION 0.75
 #define DDP_PACING_MAX_WINDOW_SEC 0.030
+
+// Discovery: how many JSON status bytes to request, and how long to wait for replies
+// (spec suggests ~500 ms because devices delay by MAC address).
+#define DDP_STATUS_QUERY_LEN 512
+#define DDP_DISCOVERY_WAIT_MS 500
 
 class DDPOutputCHOP : public CHOP_CPlusPlusBase
 {
@@ -179,11 +186,18 @@ private:
     std::string m_lastIPAddress;
     int m_lastPort;
     
-    // Device discovery
+    // Device discovery (uses its own socket so the sender thread is undisturbed)
     std::vector<std::string> m_discoveredDevices;
     bool m_isDiscovering;
     void discoverDevices();
-    void sendQueryPacket();
+    bool ensureNetworking();
+#ifdef _WIN32
+    void sendDiscoveryQuery(SOCKET sock, const sockaddr_in& dest);
+#else
+    void sendDiscoveryQuery(int sock, const sockaddr_in& dest);
+#endif
+    void collectBroadcastTargets(std::vector<sockaddr_in>& targets);
+    bool parseStatusReply(const char* buffer, int length, const sockaddr_in& from, std::string& outInfo);
     void createRoutingTable();
     
     // FPS limiting

@@ -83,12 +83,24 @@ if errorlevel 1 (
 cd ..
 
 echo.
+echo Copying DLL to repo Release folder...
+if not exist "..\Release" mkdir "..\Release"
+copy /Y "build\Release\DDPOutputCHOP.dll" "..\Release\DDPOutputCHOP.dll"
+if errorlevel 1 (
+    echo WARNING: Could not copy DLL to ..\Release\
+) else (
+    echo Copied to: %~dp0..\Release\DDPOutputCHOP.dll
+)
+
+echo.
 echo ==========================================
 echo BUILD SUCCESSFUL!
 echo ==========================================
 echo.
 echo Plugin installed to:
 echo %USERPROFILE%\Documents\Derivative\Plugins\DDPOutputCHOP.dll
+echo Repo copy:
+echo %~dp0..\Release\DDPOutputCHOP.dll
 echo.
 echo Next steps:
 echo 1. Restart TouchDesigner

@@ -28,6 +28,10 @@ Makefile
 *.dylib
 *.dll
 
+# Keep prebuilt Windows plugins in the repo
+!Release/
+!Release/*.dll
+
 # Compiled Static libraries
 *.lai
 *.la
@@ -43,6 +47,7 @@ Makefile
 *.plugin/
 *.dll
 *.so
+!Release/*.dll
 
 # macOS
 .DS_Store
@@ -78,7 +83,8 @@ Desktop.ini
 .vs/
 x64/
 Debug/
-Release/
+# VS/CMake build output only — repo root Release/ holds committed DLLs
+**/build/Release/
 *.opensdf
 *.sdf
 *.VC.db

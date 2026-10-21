@@ -8,6 +8,8 @@
 #include <errno.h>
 #ifndef _WIN32
     #include <dlfcn.h>
+    #include <ifaddrs.h>
+    #include <net/if.h>
 #endif
 
 namespace
@@ -113,6 +115,25 @@ bool isOff(const char* text)
     return value == "0" || value == "false" || value == "no" || value == "off";
 }
 
+// Menu names are "3" / "4". getParInt on a menu returns the index (0/1), while
+// older builds stored the real channel count as an int (3/4). Accept both.
+int channelsPerPixelFromInputs(const OP_Inputs* inputs)
+{
+    const char* text = inputs->getParString("Channelsperpixel");
+    if (text && text[0])
+    {
+        if (std::strcmp(text, "4") == 0)
+            return 4;
+        if (std::strcmp(text, "3") == 0)
+            return 3;
+    }
+
+    int value = inputs->getParInt("Channelsperpixel");
+    if (value == 4 || value == 1)
+        return 4;
+    return 3;
+}
+
 enum class ColKind
 {
     None,
@@ -160,7 +181,7 @@ extern "C"
         info->customOPInfo.cookOnStart = true;
 
         info->customOPInfo.pythonCallbacksDAT = kCallbacksStub;
-        info->customOPInfo.minorVersion = 2;
+        info->customOPInfo.minorVersion = 3;
     }
 
     DLLEXPORT CHOP_CPlusPlusBase* CreateCHOPInstance(const OP_NodeInfo* info)
@@ -340,19 +361,17 @@ void DDPOutputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved
         assert(res == OP_ParAppendResult::Success);
     }
     
-    // Channels Per Pixel (4 = RGBW data type in packet header, otherwise RGB)
+    // Channels Per Pixel: 3 = RGB, 4 = RGBW (same parameter name as the old int slider)
     {
-        OP_NumericParameter np;
-        np.name = "Channelsperpixel";
-        np.label = "Channels Per Pixel";
-        np.defaultValues[0] = 3.0; // RGB default
-        np.minSliders[0] = 1.0;
-        np.maxSliders[0] = 6.0;
-        np.minValues[0] = 1.0;
-        np.maxValues[0] = 10.0;
-        np.clampMins[0] = true;
-        np.clampMaxes[0] = true;
-        OP_ParAppendResult res = manager->appendInt(np);
+        OP_StringParameter sp;
+        sp.name = "Channelsperpixel";
+        sp.label = "Channels Per Pixel";
+        sp.defaultValue = "3";
+
+        const char* names[] = {"3", "4"};
+        const char* labels[] = {"3 (RGB)", "4 (RGBW)"};
+
+        OP_ParAppendResult res = manager->appendMenu(sp, 2, names, labels);
         assert(res == OP_ParAppendResult::Success);
     }
     
@@ -439,10 +458,7 @@ void DDPOutputCHOP::pulsePressed(const char* name, void* reserved1)
 
 void DDPOutputCHOP::createRoutingTable()
 {
-    if (m_socketInitialized)
-        discoverDevices();
-    else
-        m_discoveredDevices.clear();
+    discoverDevices();
 
     PythonApi py;
     if (!loadPythonApi(py))
@@ -459,11 +475,13 @@ void DDPOutputCHOP::createRoutingTable()
         return;
     }
 
-    // Discovery records "ip" or "ip:replyport"; the reply port isn't the DDP listen port, so pass IPs only.
+    // Entries may be "ip", "ip:port", or "ip (man mod)". Pass the IP only.
     PyObject* devices = py.TupleNew(static_cast<intptr_t>(m_discoveredDevices.size()));
     for (size_t i = 0; i < m_discoveredDevices.size(); i++)
     {
-        std::string ip = m_discoveredDevices[i].substr(0, m_discoveredDevices[i].find(':'));
+        const std::string& entry = m_discoveredDevices[i];
+        size_t end = entry.find_first_of(" :");
+        std::string ip = entry.substr(0, end == std::string::npos ? entry.size() : end);
         py.TupleSetItem(devices, static_cast<intptr_t>(i), py.UnicodeFromString(ip.c_str()));
     }
     py.TupleSetItem(args, 1, devices);
@@ -483,14 +501,8 @@ void DDPOutputCHOP::createRoutingTable()
     py.DecRef(result);
 }
 
-void DDPOutputCHOP::initializeSocket()
+bool DDPOutputCHOP::ensureNetworking()
 {
-    std::lock_guard<std::mutex> lock(m_socketMutex);
-    if (m_socketInitialized)
-        return;
-
-    int sendBufferBytes = DDP_SEND_BUFFER_BYTES;
-    
     #ifdef _WIN32
     if (!m_wsaInitialized)
     {
@@ -499,11 +511,26 @@ void DDPOutputCHOP::initializeSocket()
         if (result != 0)
         {
             m_lastError = "WSAStartup failed";
-            return;
+            return false;
         }
         m_wsaInitialized = true;
     }
+    #endif
+    return true;
+}
+
+void DDPOutputCHOP::initializeSocket()
+{
+    std::lock_guard<std::mutex> lock(m_socketMutex);
+    if (m_socketInitialized)
+        return;
+
+    if (!ensureNetworking())
+        return;
+
+    int sendBufferBytes = DDP_SEND_BUFFER_BYTES;
     
+    #ifdef _WIN32
     m_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (m_socket == INVALID_SOCKET)
     {
@@ -1042,7 +1069,7 @@ void DDPOutputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* 
     bool enabled = inputs->getParInt("Enable") != 0;
     float gamma = static_cast<float>(inputs->getParDouble("Gamma"));
     float brightness = static_cast<float>(inputs->getParDouble("Brightness"));
-    int channelsPerPixel = inputs->getParInt("Channelsperpixel");
+    int channelsPerPixel = channelsPerPixelFromInputs(inputs);
     bool autoPush = inputs->getParInt("Autopush") != 0;
     bool showStats = inputs->getParInt("Showstats") != 0;
     double maxFPS = inputs->getParDouble("Maxfps");
@@ -1266,188 +1293,341 @@ void DDPOutputCHOP::getInfoDATEntries(int32_t index, int32_t nEntries,
     }
 }
 
-void DDPOutputCHOP::sendQueryPacket()
+#ifdef _WIN32
+void DDPOutputCHOP::sendDiscoveryQuery(SOCKET sock, const sockaddr_in& dest)
+#else
+void DDPOutputCHOP::sendDiscoveryQuery(int sock, const sockaddr_in& dest)
+#endif
 {
-    if (!m_socketInitialized)
-        return;
-    
-    // Create DDP STATUS query packet
-    std::vector<uint8_t> packet(10);
-    
-    // Header
-    packet[0] = DDP_FLAGS1_VER1 | 0x02;  // VER1 + QUERY flag
-    packet[1] = 0;                        // Sequence 0
-    packet[2] = 0x00;                     // Data type (ignored for query)
-    packet[3] = DDP_ID_STATUS;            // STATUS destination (251)
-    packet[4] = 0;                        // Offset (all zeros)
-    packet[5] = 0;
-    packet[6] = 0;
-    packet[7] = 0;
-    packet[8] = 0;                        // Length = 0
-    packet[9] = 0;
-    
-    // Enable broadcast on socket
-    int broadcastEnable = 1;
-    #ifdef _WIN32
-        setsockopt(m_socket, SOL_SOCKET, SO_BROADCAST, (const char*)&broadcastEnable, sizeof(broadcastEnable));
-    #else
-        setsockopt(m_socket, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
-    #endif
-    
-    // Send to broadcast address (255.255.255.255)
-    struct sockaddr_in broadcastAddr;
-    memset(&broadcastAddr, 0, sizeof(broadcastAddr));
-    broadcastAddr.sin_family = AF_INET;
-    broadcastAddr.sin_port = htons(DDP_PORT);
-    broadcastAddr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-    
-    sendto(m_socket, 
-           reinterpret_cast<const char*>(packet.data()), 
-           static_cast<int>(packet.size()), 
+    // DDP JSON Status read (ID 251). Length is bytes requested, not payload size.
+    uint8_t packet[DDP_HEADER_SIZE] = {};
+    packet[0] = DDP_FLAGS1_VER1 | DDP_FLAGS1_QUERY;
+    packet[1] = 0;
+    packet[2] = 0;
+    packet[3] = DDP_ID_STATUS;
+    packet[8] = static_cast<uint8_t>((DDP_STATUS_QUERY_LEN >> 8) & 0xFF);
+    packet[9] = static_cast<uint8_t>(DDP_STATUS_QUERY_LEN & 0xFF);
+
+    sendto(sock,
+           reinterpret_cast<const char*>(packet),
+           DDP_HEADER_SIZE,
            0,
-           reinterpret_cast<struct sockaddr*>(&broadcastAddr), 
-           sizeof(broadcastAddr));
-    
-    // Also try sending to the configured destination (if it's set)
-    if (m_destAddr.sin_addr.s_addr != 0)
+           reinterpret_cast<const struct sockaddr*>(&dest),
+           sizeof(dest));
+}
+
+void DDPOutputCHOP::collectBroadcastTargets(std::vector<sockaddr_in>& targets)
+{
+    auto addTarget = [&targets](in_addr addr)
     {
-        struct sockaddr_in targetAddr = m_destAddr;
-        targetAddr.sin_port = htons(DDP_PORT);
-        
-        sendto(m_socket, 
-               reinterpret_cast<const char*>(packet.data()), 
-               static_cast<int>(packet.size()), 
-               0,
-               reinterpret_cast<struct sockaddr*>(&targetAddr), 
-               sizeof(targetAddr));
+        if (addr.s_addr == 0 || addr.s_addr == htonl(INADDR_LOOPBACK))
+            return;
+        for (const sockaddr_in& existing : targets)
+        {
+            if (existing.sin_addr.s_addr == addr.s_addr)
+                return;
+        }
+        sockaddr_in dest;
+        memset(&dest, 0, sizeof(dest));
+        dest.sin_family = AF_INET;
+        dest.sin_port = htons(DDP_PORT);
+        dest.sin_addr = addr;
+        targets.push_back(dest);
+    };
+
+    // Global broadcast (some networks block this; subnet broadcasts below cover most cases).
+    in_addr globalBroadcast;
+    globalBroadcast.s_addr = htonl(INADDR_BROADCAST);
+    addTarget(globalBroadcast);
+
+    #ifdef _WIN32
+    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG bufLen = 15000;
+    std::vector<uint8_t> buffer(bufLen);
+    PIP_ADAPTER_ADDRESSES adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+    ULONG result = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &bufLen);
+    if (result == ERROR_BUFFER_OVERFLOW)
+    {
+        buffer.resize(bufLen);
+        adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+        result = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &bufLen);
     }
+    if (result == NO_ERROR)
+    {
+        for (PIP_ADAPTER_ADDRESSES adapter = adapters; adapter; adapter = adapter->Next)
+        {
+            if (adapter->OperStatus != IfOperStatusUp)
+                continue;
+            for (PIP_ADAPTER_UNICAST_ADDRESS unicast = adapter->FirstUnicastAddress; unicast; unicast = unicast->Next)
+            {
+                if (!unicast->Address.lpSockaddr || unicast->Address.lpSockaddr->sa_family != AF_INET)
+                    continue;
+                auto* sa = reinterpret_cast<sockaddr_in*>(unicast->Address.lpSockaddr);
+                ULONG prefix = unicast->OnLinkPrefixLength;
+                if (prefix == 0 || prefix > 30)
+                    prefix = 24;
+                uint32_t ip = ntohl(sa->sin_addr.s_addr);
+                uint32_t mask = prefix == 0 ? 0 : (0xFFFFFFFFu << (32 - prefix));
+                in_addr bcast;
+                bcast.s_addr = htonl((ip & mask) | ~mask);
+                addTarget(bcast);
+            }
+        }
+    }
+    #else
+    struct ifaddrs* ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) == 0)
+    {
+        for (struct ifaddrs* ifa = ifaddr; ifa; ifa = ifa->ifa_next)
+        {
+            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+                continue;
+            if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
+                continue;
+            if (ifa->ifa_flags & IFF_BROADCAST && ifa->ifa_broadaddr)
+            {
+                auto* bcast = reinterpret_cast<sockaddr_in*>(ifa->ifa_broadaddr);
+                addTarget(bcast->sin_addr);
+            }
+            else
+            {
+                auto* sa = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
+                uint32_t ip = ntohl(sa->sin_addr.s_addr);
+                in_addr bcast;
+                bcast.s_addr = htonl((ip & 0xFFFFFF00u) | 0xFFu);
+                addTarget(bcast);
+            }
+        }
+        freeifaddrs(ifaddr);
+    }
+    #endif
+
+    // Also poke the configured controller IP directly.
+    if (m_destAddr.sin_addr.s_addr != 0)
+        addTarget(m_destAddr.sin_addr);
+}
+
+bool DDPOutputCHOP::parseStatusReply(const char* buffer, int length, const sockaddr_in& from, std::string& outInfo)
+{
+    if (!buffer || length < DDP_HEADER_SIZE)
+        return false;
+
+    const auto* bytes = reinterpret_cast<const uint8_t*>(buffer);
+    uint8_t flags = bytes[0];
+    uint8_t id = bytes[3];
+    if ((flags & DDP_FLAGS1_REPLY) == 0)
+        return false;
+    if (id != DDP_ID_STATUS)
+        return false;
+
+    char ipStr[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &from.sin_addr, ipStr, INET_ADDRSTRLEN);
+    outInfo = ipStr;
+
+    uint16_t dataLen = static_cast<uint16_t>((bytes[8] << 8) | bytes[9]);
+    int payloadStart = DDP_HEADER_SIZE;
+    if (flags & DDP_FLAGS1_TIME)
+        payloadStart += 4;
+    if (dataLen > 0 && payloadStart + dataLen <= length)
+    {
+        std::string json(buffer + payloadStart, buffer + payloadStart + dataLen);
+        auto extract = [&json](const char* key) -> std::string
+        {
+            std::string needle = std::string("\"") + key + "\"";
+            size_t pos = json.find(needle);
+            if (pos == std::string::npos)
+                return {};
+            pos = json.find(':', pos + needle.size());
+            if (pos == std::string::npos)
+                return {};
+            pos = json.find('"', pos + 1);
+            if (pos == std::string::npos)
+                return {};
+            size_t end = json.find('"', pos + 1);
+            if (end == std::string::npos)
+                return {};
+            return json.substr(pos + 1, end - pos - 1);
+        };
+
+        std::string man = extract("man");
+        std::string mod = extract("mod");
+        if (!man.empty() || !mod.empty())
+        {
+            outInfo += " (";
+            if (!man.empty())
+                outInfo += man;
+            if (!man.empty() && !mod.empty())
+                outInfo += " ";
+            if (!mod.empty())
+                outInfo += mod;
+            outInfo += ")";
+        }
+    }
+
+    return true;
 }
 
 void DDPOutputCHOP::discoverDevices()
 {
-    if (!m_socketInitialized)
+    m_discoveredDevices.clear();
+    m_isDiscovering = true;
+
+    if (!ensureNetworking())
     {
-        m_lastError = "Socket not initialized. Enable output first.";
+        m_isDiscovering = false;
         return;
     }
 
-    // Keep the sender thread off the socket while it's switched to non-blocking.
-    std::lock_guard<std::mutex> lock(m_socketMutex);
-    
-    // Clear previous discoveries
-    m_discoveredDevices.clear();
-    m_isDiscovering = true;
-    
-    m_lastError = "Sending discovery query...";
-    
-    // Send query packet (try multiple times)
-    for (int i = 0; i < 3; i++)
+    #ifdef _WIN32
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET)
     {
-        sendQueryPacket();
-        #ifdef _WIN32
-            Sleep(50);
-        #else
-            usleep(50000);
-        #endif
+        m_lastError = "Discovery: socket creation failed";
+        m_isDiscovering = false;
+        return;
     }
-    
-    // Set socket to non-blocking temporarily
-    #ifdef _WIN32
-        u_long mode = 1;  // 1 = non-blocking
-        ioctlsocket(m_socket, FIONBIO, &mode);
+    BOOL broadcastEnable = TRUE;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (char*)&broadcastEnable, sizeof(broadcastEnable));
+    u_long nonBlocking = 1;
+    ioctlsocket(sock, FIONBIO, &nonBlocking);
     #else
-        int sockFlags = fcntl(m_socket, F_GETFL, 0);
-        fcntl(m_socket, F_SETFL, sockFlags | O_NONBLOCK);
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0)
+    {
+        m_lastError = "Discovery: socket creation failed";
+        m_isDiscovering = false;
+        return;
+    }
+    int broadcastEnable = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
+    int sockFlags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, sockFlags | O_NONBLOCK);
     #endif
-    
-    // Listen for responses for ~500ms (longer timeout for FPP)
+
+    sockaddr_in localAddr;
+    memset(&localAddr, 0, sizeof(localAddr));
+    localAddr.sin_family = AF_INET;
+    localAddr.sin_addr.s_addr = INADDR_ANY;
+    localAddr.sin_port = htons(0);
+    #ifdef _WIN32
+    if (bind(sock, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) == SOCKET_ERROR)
+    {
+        m_lastError = "Discovery: bind failed";
+        closesocket(sock);
+        m_isDiscovering = false;
+        return;
+    }
+    #else
+    if (bind(sock, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) < 0)
+    {
+        m_lastError = "Discovery: bind failed";
+        close(sock);
+        m_isDiscovering = false;
+        return;
+    }
+    #endif
+
+    std::vector<sockaddr_in> targets;
+    collectBroadcastTargets(targets);
+
+    m_lastError = "Sending discovery query to " + std::to_string(targets.size()) + " address(es)...";
+
+    auto sendAll = [this, sock, &targets]()
+    {
+        for (const sockaddr_in& dest : targets)
+            sendDiscoveryQuery(sock, dest);
+    };
+
+    // A few spaced queries; devices may delay replies by MAC (spec ~500 ms window).
+    sendAll();
+    #ifdef _WIN32
+        Sleep(40);
+    #else
+        usleep(40000);
+    #endif
+    sendAll();
+    #ifdef _WIN32
+        Sleep(40);
+    #else
+        usleep(40000);
+    #endif
+    sendAll();
+
     char buffer[2048];
-    struct sockaddr_in responseAddr;
-    
-    #ifdef _WIN32
-        int addrLen = sizeof(responseAddr);
-    #else
-        socklen_t addrLen = sizeof(responseAddr);
-    #endif
-    
-    // Try to receive responses (non-blocking)
+    sockaddr_in responseAddr;
     int packetsReceived = 0;
-    for (int i = 0; i < 50; i++)  // 50 attempts with ~10ms between = 500ms total
+    const int polls = DDP_DISCOVERY_WAIT_MS / 10;
+    for (int i = 0; i < polls; i++)
     {
         #ifdef _WIN32
-            addrLen = sizeof(responseAddr);
+        int addrLen = sizeof(responseAddr);
         #else
-            addrLen = sizeof(responseAddr);
+        socklen_t addrLen = sizeof(responseAddr);
         #endif
-        
-        int received = recvfrom(m_socket, buffer, sizeof(buffer), 0,
-                               reinterpret_cast<struct sockaddr*>(&responseAddr),
-                               &addrLen);
-        
-        if (received > 0)
+
+        while (true)
         {
+            #ifdef _WIN32
+            addrLen = sizeof(responseAddr);
+            #else
+            addrLen = sizeof(responseAddr);
+            #endif
+            int received = recvfrom(sock, buffer, sizeof(buffer), 0,
+                                    reinterpret_cast<sockaddr*>(&responseAddr), &addrLen);
+            if (received <= 0)
+                break;
+
             packetsReceived++;
-            
-            // Get IP address regardless of packet content
-            char ipStr[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &responseAddr.sin_addr, ipStr, INET_ADDRSTRLEN);
-            
-            // Store discovered device - be very permissive
-            // Accept ANY UDP response on ANY port as a potential DDP device
-            std::string deviceInfo = std::string(ipStr);
-            
-            // Add port if not standard DDP port
-            if (ntohs(responseAddr.sin_port) != DDP_PORT)
-            {
-                deviceInfo += ":" + std::to_string(ntohs(responseAddr.sin_port));
-            }
-            
-            // Check for duplicates
+            std::string deviceInfo;
+            if (!parseStatusReply(buffer, received, responseAddr, deviceInfo))
+                continue;
+
+            size_t ipEnd = deviceInfo.find_first_of(" :");
+            std::string ipOnly = deviceInfo.substr(0, ipEnd == std::string::npos ? deviceInfo.size() : ipEnd);
+
             bool found = false;
             for (const auto& dev : m_discoveredDevices)
             {
-                if (dev == deviceInfo)
+                size_t existingEnd = dev.find_first_of(" :");
+                std::string existingIp = dev.substr(0, existingEnd == std::string::npos ? dev.size() : existingEnd);
+                if (existingIp == ipOnly)
                 {
                     found = true;
                     break;
                 }
             }
-            
             if (!found)
             {
                 m_discoveredDevices.push_back(deviceInfo);
-                m_lastError = "Found device: " + deviceInfo + " (packet size: " + std::to_string(received) + ")";
+                m_lastError = "Found device: " + deviceInfo;
             }
         }
-        
-        // Small delay between attempts
+
         #ifdef _WIN32
             Sleep(10);
         #else
-            usleep(10000);  // 10ms
+            usleep(10000);
         #endif
     }
-    
-    m_lastError = "Discovery scan complete. Received " + std::to_string(packetsReceived) + " packets";
-    
-    // Restore blocking mode
+
     #ifdef _WIN32
-        mode = 0;  // 0 = blocking
-        ioctlsocket(m_socket, FIONBIO, &mode);
+        closesocket(sock);
     #else
-        sockFlags = fcntl(m_socket, F_GETFL, 0);
-        fcntl(m_socket, F_SETFL, sockFlags & ~O_NONBLOCK);
+        close(sock);
     #endif
-    
+
     m_isDiscovering = false;
-    
+
     if (m_discoveredDevices.empty())
     {
-        m_lastError += " - No devices responded. Check: 1) Device is on, 2) Same network/subnet, 3) Windows firewall, 4) Try entering IP manually";
+        m_lastError = "Discovery complete: 0 devices (" + std::to_string(packetsReceived)
+            + " packet(s)). Controllers must answer DDP JSON status (ID 251). "
+              "WLED often does not. Check subnet/firewall, or enter IPs in the routing table.";
     }
     else
     {
-        m_lastError = "Discovery complete: " + std::to_string(m_discoveredDevices.size()) + " device(s) found";
+        m_lastError = "Discovery complete: " + std::to_string(m_discoveredDevices.size())
+            + " device(s) found (" + std::to_string(packetsReceived) + " packet(s))";
     }
 }
 

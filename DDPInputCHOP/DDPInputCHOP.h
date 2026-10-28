@@ -11,6 +11,7 @@
 #endif
 
 #include "CHOP_CPlusPlusBase.h"
+#include <chrono>
 #include <vector>
 #include <string>
 
@@ -24,11 +25,7 @@ using namespace TD;
     #include <fcntl.h>
 #endif
 
-// DDP Protocol Constants
-#define DDP_PORT 4048
-#define DDP_HEADER_SIZE 10
-#define DDP_HEADER_SIZE_TIMECODE 14
-#define DDP_MAX_DATALEN (480 * 3)
+#include "DDPProtocol.h"
 
 // Upper bound on the reassembled frame buffer; packets addressing beyond this are dropped
 #define DDP_MAX_FRAME_BYTES (1024 * 1024)
@@ -36,14 +33,9 @@ using namespace TD;
 // Requested OS socket receive buffer size
 #define DDP_RECV_BUFFER_BYTES (4 * 1024 * 1024)
 
-// DDP Flags
-#define DDP_FLAGS1_VER     0xC0
-#define DDP_FLAGS1_VER1    0x40
-#define DDP_FLAGS1_PUSH    0x01
-#define DDP_FLAGS1_TIME    0x10
-
-// DDP IDs
-#define DDP_ID_DISPLAY  1
+// Without a PUSH from any sender for this long, frames are shown as packets
+// arrive (senders that never set PUSH)
+#define DDP_PUSH_TIMEOUT_SEC 1.0
 
 class DDPInputCHOP : public CHOP_CPlusPlusBase
 {
@@ -71,10 +63,13 @@ private:
     void closeSocket();
     
     // Receive and parse
-    void receiveData();
+    void receiveData(bool discoverable);
     bool parseDDPPacket(const uint8_t* buffer, size_t length, 
                         uint32_t& offset, uint16_t& dataLen, 
                         const uint8_t*& pixelData);
+    bool isStatusQuery(const uint8_t* buffer, size_t length) const;
+    void sendStatusReply(const sockaddr_in& to);
+    void publishFrame();
     
     // Socket members
     #ifdef _WIN32
@@ -85,13 +80,18 @@ private:
     #endif
     
     bool m_socketInitialized;
-    int m_lastPort;
     
-    // Received data
+    // Packets are assembled in m_workPixelData and copied to m_receivedPixelData
+    // (what the CHOP outputs) on PUSH, so a frame never shows half old, half new.
+    std::vector<uint8_t> m_workPixelData;
     std::vector<uint8_t> m_receivedPixelData;
+    bool m_workDirty;
+    std::chrono::steady_clock::time_point m_lastPushTime;
+    bool m_pushSeen;
     int32_t m_receivedPixelCount;
     int64_t m_packetsReceived;
     int64_t m_bytesReceived;
+    int64_t m_framesReceived;
     bool m_showStats;
     
     // Source tracking

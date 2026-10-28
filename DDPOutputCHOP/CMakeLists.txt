@@ -7,6 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Source files
 set(SOURCES
     DDPOutputCHOP.cpp
+    DDPOutputSender.cpp
+    DDPOutputDiscovery.cpp
     DDPOutputCHOP.h
     CHOP_CPlusPlusBase.h
     CPlusPlus_Common.h
@@ -14,6 +16,7 @@ set(SOURCES
 
 # Create MODULE library (plugin)
 add_library(DDPOutputCHOP MODULE ${SOURCES})
+target_include_directories(DDPOutputCHOP PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common)
 
 # Packets are sent from a background thread
 find_package(Threads REQUIRED)

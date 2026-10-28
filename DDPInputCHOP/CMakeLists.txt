@@ -13,6 +13,8 @@ set(SOURCE_FILES
 )
 
 # Platform-specific settings
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../common)
+
 if(APPLE)
     # macOS - create bundle
     add_library(DDPInputCHOP MODULE ${SOURCE_FILES})

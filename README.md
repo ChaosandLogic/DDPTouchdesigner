@@ -23,31 +23,30 @@ Expects one CHOP channel of interleaved samples (`r0,g0,b0,r1,g1,b1…`), same i
 | Parameter | Description |
 |-----------|-------------|
 | IP Address | Controller IP. Used when Routing Table is empty |
-| Port | DDP port (default: 4048). Default for table rows that leave port blank |
 | Routing Table | Optional table DAT. Each row sends a pixel slice to an IP |
 | Enable | Toggle output |
 | Gamma | Gamma correction (1.0 = none) |
 | Brightness | Master brightness (0-1) |
 | Value Range | Input format: 0-1 (default) or 0-255 |
 | Channels Per Pixel | Dropdown: 3 (RGB) or 4 (RGBW). Used for routing and pixel counts |
-| Auto Push | PUSH flag on the last data packet to each controller |
 | Max FPS | Cap send rate (0 = unlimited) |
-| Show Stats | Track packets/bytes sent in the Info DAT (off by default) |
-| Discover Devices | Broadcast a DDP JSON status query (ID 251) on the local subnets and list responders in the Info DAT. Does not require Enable. Controllers that only receive DDP pixel data (many WLED builds) will not appear |
-| Create Routing Table | Run discovery, then create `<name>_routing` next to the node with any found IPs and assign it to Routing Table. Pressing it again keeps your rows and appends new IPs |
+| Show Stats | Track packets/bytes sent on the node's Info CHOP (off by default) |
+| Discover & Update Routing Table | Broadcast a DDP JSON status query (ID 251) on the local subnets, list responders in the Info DAT, then add any found IPs to the assigned Routing Table (or create `<name>_routing` docked to the node if none is assigned). Rows with an empty ip cell are filled first, then new rows are added. IPs already in the table and the rest of your rows are left alone. Does not require Enable. Controllers that only receive DDP pixel data (many WLED builds) will not appear |
 
-Create Routing Table uses the node's Callbacks DAT (`onCreateRoutingTable`), which TouchDesigner creates from the plugin's template. Nodes created before this version won't have it. Recreate the node to get it.
+**Automatic routing table and Info DAT:** when you place a new DDP Out, it runs discovery in the background and, about a second later, creates `<name>_routing` with any found IPs, assigns it to Routing Table, and creates `<name>_info`, an Info DAT watching the node. Both are docked to the DDP Out. It only does this for a node that looks freshly placed (no Routing Table, no input wired, IP Address still `127.0.0.1`), and only once: a flag in the node's storage stops it running again when the project is reopened. To use single-IP mode instead, delete the table and clear Routing Table; it won't be recreated. A copied/pasted node inherits the flag, so use Discover & Update Routing Table for it (the button doesn't create an Info DAT). The Info DAT lists Last Status, Devices Found, Frames Dropped, and one row per discovered device.
+
+The plugin builds and updates the table itself with a short Python script run through CPython's stable ABI (`python3.dll` on Windows).
 
 Leave Routing Table empty to send the whole input to IP Address. Otherwise use a Table DAT:
 
 ```
-ip              pixels    port    start    active
-192.168.1.10    300       4048
+ip              pixels    start    active
+192.168.1.10    300
 192.168.1.11    170
 192.168.1.12
 ```
 
-`pixels` is how many pixels that row takes. Rows pack in order. A blank `pixels` cell takes the rest. Each controller gets its slice at DDP offset 0. `start` overrides the sequential index. `active` set to 0 skips the row. With no `pixels` column, every IP receives the full input.
+All output goes to the standard DDP port, 4048. A `port` column in older tables is ignored. `pixels` is how many pixels that row takes. Rows pack in order. A `pixels` value of 0 sends nothing to that row. A blank `pixels` cell takes the rest. Each controller gets its slice at DDP offset 0. `start` overrides the sequential index. `active` set to 0 skips the row. With no `pixels` column, every IP receives the full input.
 
 #### Sending behaviour
 
@@ -59,16 +58,20 @@ ip              pixels    port    start    active
 
 If a WLED controller still flickers on large pixel counts, turn off **Skip out-of-sequence packets** in its Sync settings.
 
-Discovery uses a dedicated socket (so live output is not interrupted), requests JSON status with a non-zero read length, and sends to both `255.255.255.255` and each local subnet broadcast. Only valid DDP status **replies** are listed. Devices that never implement status (common on WLED) need manual IPs in the routing table.
+Discovery uses a dedicated socket (so live output is not interrupted), requests JSON status with a non-zero read length, and sends to `127.0.0.1`, `255.255.255.255`, and each local subnet broadcast. Only valid DDP status **replies** are listed. Devices that never implement status (common on WLED) need manual IPs in the routing table. A DDP In on this computer is listed once as `127.0.0.1`; turn on **Discoverable** if you want other machines to see it too.
 
 ### DDP In
-Receive DDP data from other sources.
+Receive DDP data from other sources. Always listens on the standard DDP port, 4048, so only one DDP In per machine can receive at a time.
 
 | Parameter | Description |
 |-----------|-------------|
-| Listen Port | Port to receive on (default: 4048) |
 | Enable | Toggle receiver |
+| Show Stats | Track packets/bytes received in the Info DAT (off by default) |
 | Value Range | Output format: 0-1 (default) or 0-255 |
+| Channels Per Pixel | Dropdown: 3 (RGB) or 4 (RGBW). Used for `pixel_count`; `pixel_data` is the raw channel bytes either way |
+| Discoverable | Answer DDP status queries so DDP Out's discovery lists this machine as `TouchDesigner DDP In`. Off by default for other machines; queries from this computer (`127.0.0.1`) are always answered so a DDP Out in the same project can find it |
+
+Incoming packets are assembled off-screen and shown when the sender's **PUSH** packet arrives, so a frame never appears half old and half new. If no PUSH has arrived for a second (senders that never set the flag), packets are shown as they arrive, once per cook. The Info DAT's **Frames Received** row counts shown frames.
 
 ## Compatible Controllers
 

@@ -5,6 +5,23 @@
 
 using namespace TD;
 
+namespace
+{
+
+const char* kStatusReplyJson =
+    "{\"status\":{\"man\":\"TouchDesigner\",\"mod\":\"DDP In\",\"ver\":\"1.0\"}}";
+
+// Menu names are "3" / "4", matching DDP Out.
+int channelsPerPixelFromInputs(const OP_Inputs* inputs)
+{
+    const char* text = inputs->getParString("Channelsperpixel");
+    if (text && std::strcmp(text, "4") == 0)
+        return 4;
+    return 3;
+}
+
+} // namespace
+
 // Plugin Info
 extern "C"
 {
@@ -35,10 +52,12 @@ extern "C"
 DDPInputCHOP::DDPInputCHOP(const OP_NodeInfo* info) : myNodeInfo(info)
 {
     m_socketInitialized = false;
-    m_lastPort = 0;
+    m_workDirty = false;
+    m_pushSeen = false;
     m_receivedPixelCount = 0;
     m_packetsReceived = 0;
     m_bytesReceived = 0;
+    m_framesReceived = 0;
     m_showStats = false;
     m_lastSourcePort = 0;
     
@@ -98,20 +117,6 @@ void DDPInputCHOP::getChannelName(int32_t index, OP_String *name, const OP_Input
 
 void DDPInputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved1)
 {
-    // Port
-    {
-        OP_NumericParameter np;
-        np.name = "Port";
-        np.label = "Listen Port";
-        np.defaultValues[0] = DDP_PORT;
-        np.minSliders[0] = 1;
-        np.maxSliders[0] = 65535;
-        np.minValues[0] = 1;
-        np.maxValues[0] = 65535;
-        OP_ParAppendResult res = manager->appendInt(np);
-        assert(res == OP_ParAppendResult::Success);
-    }
-    
     // Enable
     {
         OP_NumericParameter np;
@@ -145,14 +150,40 @@ void DDPInputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved1
         OP_ParAppendResult res = manager->appendMenu(sp, 2, names, labels);
         assert(res == OP_ParAppendResult::Success);
     }
+
+    // Channels Per Pixel (only affects pixel_count; pixel_data is raw bytes)
+    {
+        OP_StringParameter sp;
+        sp.name = "Channelsperpixel";
+        sp.label = "Channels Per Pixel";
+        sp.defaultValue = "3";
+
+        const char* names[] = {"3", "4"};
+        const char* labels[] = {"3 (RGB)", "4 (RGBW)"};
+
+        OP_ParAppendResult res = manager->appendMenu(sp, 2, names, labels);
+        assert(res == OP_ParAppendResult::Success);
+    }
+
+    // Discoverable: answer DDP status queries so DDP Out's discovery lists this machine.
+    // Off by default so DDP Out doesn't add your own receiver to its routing table.
+    {
+        OP_NumericParameter np;
+        np.name = "Discoverable";
+        np.label = "Discoverable";
+        np.defaultValues[0] = 0;
+        OP_ParAppendResult res = manager->appendToggle(np);
+        assert(res == OP_ParAppendResult::Success);
+    }
 }
 
 void DDPInputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved1)
 {
     // Get parameters
-    int port = inputs->getParInt("Port");
     bool enabled = inputs->getParInt("Enable") != 0;
     bool showStats = inputs->getParInt("Showstats") != 0;
+    bool discoverable = inputs->getParInt("Discoverable") != 0;
+    int channelsPerPixel = channelsPerPixelFromInputs(inputs);
     const char* valueRange = inputs->getParString("Valuerange");
     bool normalizedOutput = (strcmp(valueRange, "0-1") == 0);
     
@@ -161,6 +192,7 @@ void DDPInputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* r
     {
         m_packetsReceived = 0;
         m_bytesReceived = 0;
+        m_framesReceived = 0;
     }
     m_showStats = showStats;
     
@@ -178,13 +210,6 @@ void DDPInputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* r
         return;
     }
     
-    // Check if port changed
-    if (m_lastPort != port && m_socketInitialized)
-    {
-        closeSocket();
-    }
-    m_lastPort = port;
-    
     // Initialize socket if needed
     if (!m_socketInitialized)
     {
@@ -194,15 +219,17 @@ void DDPInputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* r
         struct sockaddr_in bindAddr;
         memset(&bindAddr, 0, sizeof(bindAddr));
         bindAddr.sin_family = AF_INET;
-        bindAddr.sin_port = htons(port);
+        bindAddr.sin_port = htons(DDP_PORT);
         bindAddr.sin_addr.s_addr = INADDR_ANY;
         
         if (bind(m_socket, (struct sockaddr*)&bindAddr, sizeof(bindAddr)) < 0)
         {
             #ifdef _WIN32
-                m_lastError = "bind failed: " + std::to_string(WSAGetLastError());
+                m_lastError = "bind to port 4048 failed (another DDP In or app using it?): " +
+                              std::to_string(WSAGetLastError());
             #else
-                m_lastError = "bind failed: " + std::string(strerror(errno));
+                m_lastError = "bind to port 4048 failed (another DDP In or app using it?): " +
+                              std::string(strerror(errno));
             #endif
             closeSocket();
             output->channels[0][0] = 0.0f;
@@ -220,7 +247,8 @@ void DDPInputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* r
     }
     
     // Receive and parse DDP packets
-    receiveData();
+    receiveData(discoverable);
+    m_receivedPixelCount = static_cast<int32_t>(m_receivedPixelData.size() / channelsPerPixel);
     
     // Output status channels
     output->channels[0][0] = enabled ? 1.0f : 0.0f;
@@ -274,7 +302,7 @@ void DDPInputCHOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void* r
 
 bool DDPInputCHOP::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1)
 {
-    infoSize->rows = 6;
+    infoSize->rows = 7;
     infoSize->cols = 2;
     infoSize->byColumn = false;
     return true;
@@ -301,7 +329,7 @@ void DDPInputCHOP::getInfoDATEntries(int32_t index, int32_t nEntries,
     else if (index == 3)
     {
         entries->values[0]->setString("Listen Port");
-        entries->values[1]->setString(std::to_string(m_lastPort).c_str());
+        entries->values[1]->setString(std::to_string(DDP_PORT).c_str());
     }
     else if (index == 4)
     {
@@ -315,6 +343,11 @@ void DDPInputCHOP::getInfoDATEntries(int32_t index, int32_t nEntries,
     {
         entries->values[0]->setString("Last Error");
         entries->values[1]->setString(m_lastError.c_str());
+    }
+    else if (index == 6)
+    {
+        entries->values[0]->setString("Frames Received");
+        entries->values[1]->setString(std::to_string(m_framesReceived).c_str());
     }
 }
 
@@ -380,18 +413,18 @@ void DDPInputCHOP::closeSocket()
     #endif
 }
 
-void DDPInputCHOP::receiveData()
+void DDPInputCHOP::receiveData(bool discoverable)
 {
     if (!m_socketInitialized)
         return;
     
     uint8_t buffer[2048];
     struct sockaddr_in sourceAddr;
-    socklen_t sourceAddrLen = sizeof(sourceAddr);
     
     // Receive all available packets (non-blocking)
     while (true)
     {
+        socklen_t sourceAddrLen = sizeof(sourceAddr);
         #ifdef _WIN32
             int bytesReceived = recvfrom(m_socket, (char*)buffer, sizeof(buffer), 0,
                                         (struct sockaddr*)&sourceAddr, &sourceAddrLen);
@@ -417,6 +450,14 @@ void DDPInputCHOP::receiveData()
         
         if (bytesReceived < DDP_HEADER_SIZE)
             continue;
+
+        if (isStatusQuery(buffer, bytesReceived))
+        {
+            bool fromLoopback = ntohl(sourceAddr.sin_addr.s_addr) == INADDR_LOOPBACK;
+            if (discoverable || fromLoopback)
+                sendStatusReply(sourceAddr);
+            continue;
+        }
         
         // Parse DDP packet
         uint32_t offset;
@@ -446,20 +487,66 @@ void DDPInputCHOP::receiveData()
                               " exceeds max frame size of " + std::to_string(DDP_MAX_FRAME_BYTES) + " bytes";
                 continue;
             }
-            if (m_receivedPixelData.size() < requiredSize)
+            if (m_workPixelData.size() < requiredSize)
             {
-                m_receivedPixelData.resize(requiredSize, 0);
+                m_workPixelData.resize(requiredSize, 0);
             }
             
-            // Copy pixel data
-            std::memcpy(m_receivedPixelData.data() + offset, pixelData, dataLen);
-            
-            // Update pixel count
-            m_receivedPixelCount = static_cast<int32_t>(m_receivedPixelData.size() / 3);
+            std::memcpy(m_workPixelData.data() + offset, pixelData, dataLen);
+            m_workDirty = true;
+
+            if (buffer[0] & DDP_FLAGS1_PUSH)
+            {
+                m_pushSeen = true;
+                m_lastPushTime = std::chrono::steady_clock::now();
+                publishFrame();
+            }
             
             m_lastError = "";
         }
     }
+
+    // Senders that never set PUSH (or stopped) still get shown, once per cook.
+    if (m_workDirty)
+    {
+        double sincePush = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_lastPushTime).count();
+        if (!m_pushSeen || sincePush > DDP_PUSH_TIMEOUT_SEC)
+            publishFrame();
+    }
+}
+
+void DDPInputCHOP::publishFrame()
+{
+    m_receivedPixelData = m_workPixelData;
+    m_workDirty = false;
+    m_framesReceived++;
+}
+
+bool DDPInputCHOP::isStatusQuery(const uint8_t* buffer, size_t length) const
+{
+    if (length < DDP_HEADER_SIZE)
+        return false;
+    uint8_t flags = buffer[0];
+    return (flags & DDP_FLAGS1_VER) == DDP_FLAGS1_VER1 &&
+           (flags & DDP_FLAGS1_QUERY) != 0 &&
+           buffer[3] == DDP_ID_STATUS;
+}
+
+void DDPInputCHOP::sendStatusReply(const sockaddr_in& to)
+{
+    size_t jsonLen = std::strlen(kStatusReplyJson);
+    std::vector<uint8_t> packet(DDP_HEADER_SIZE + jsonLen);
+    packet[0] = DDP_FLAGS1_VER1 | DDP_FLAGS1_REPLY | DDP_FLAGS1_PUSH;
+    packet[1] = 0;
+    packet[2] = 0;
+    packet[3] = DDP_ID_STATUS;
+    packet[4] = packet[5] = packet[6] = packet[7] = 0;
+    packet[8] = static_cast<uint8_t>((jsonLen >> 8) & 0xFF);
+    packet[9] = static_cast<uint8_t>(jsonLen & 0xFF);
+    std::memcpy(packet.data() + DDP_HEADER_SIZE, kStatusReplyJson, jsonLen);
+
+    sendto(m_socket, reinterpret_cast<const char*>(packet.data()), static_cast<int>(packet.size()), 0,
+           reinterpret_cast<const sockaddr*>(&to), sizeof(to));
 }
 
 bool DDPInputCHOP::parseDDPPacket(const uint8_t* buffer, size_t length,

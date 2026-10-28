@@ -33,28 +33,7 @@ using namespace TD;
     #include <fcntl.h>
 #endif
 
-// DDP Protocol Constants (from official spec: http://www.3waylabs.com/ddp/)
-#define DDP_PORT 4048
-#define DDP_HEADER_SIZE 10
-#define DDP_MAX_DATALEN (480 * 3)  // 1440 bytes - official spec recommendation
-#define DDP_MAX_PIXELS_PER_PACKET 480
-
-// DDP Flags (Byte 0)
-#define DDP_FLAGS1_VER     0xC0  // Version mask
-#define DDP_FLAGS1_VER1    0x40  // Version 1
-#define DDP_FLAGS1_PUSH    0x01  // Push flag - display data now (sync)
-#define DDP_FLAGS1_QUERY   0x02  // Query request
-#define DDP_FLAGS1_REPLY   0x04  // Reply to query  
-#define DDP_FLAGS1_STORAGE 0x08  // Use local storage
-#define DDP_FLAGS1_TIME    0x10  // Timecode field present
-
-// DDP IDs
-#define DDP_ID_DISPLAY  1    // Display data
-#define DDP_ID_CONFIG   250  // Configuration
-#define DDP_ID_STATUS   251  // Status/discovery
-
-// Undefined/generic data type: the controller interprets the channel stream.
-#define DDP_DATA_TYPE_UNDEFINED 0x00
+#include "DDPProtocol.h"
 
 // Requested socket send buffer. The OS default is too small for a whole frame of packets.
 #define DDP_SEND_BUFFER_BYTES (4 * 1024 * 1024)
@@ -109,7 +88,6 @@ private:
     {
         std::vector<uint8_t> pixels;
         std::vector<DeviceRoute> routes;
-        bool autoPush = true;
         double pacingWindowSec = 0.0;  // 0 = send as one burst
     };
 
@@ -122,7 +100,7 @@ private:
 
     // Sender thread
     void senderLoop();
-    void submitFrame(std::vector<DeviceRoute>& routes, bool autoPush);
+    void submitFrame(std::vector<DeviceRoute>& routes);
 
     // Routing table. Returns false when no table is assigned (single-IP mode).
     bool parseRoutingTable(const OP_Inputs* inputs, int channelsPerPixel, size_t dataBytes,
@@ -184,21 +162,44 @@ private:
     std::vector<DeviceRoute> m_routes;
     std::string m_lastError;
     std::string m_lastIPAddress;
-    int m_lastPort;
     
     // Device discovery (uses its own socket so the sender thread is undisturbed)
     std::vector<std::string> m_discoveredDevices;
     bool m_isDiscovering;
     void discoverDevices();
+    void startAsyncDiscovery();
+    bool collectAsyncDiscovery();
+    // Touches only its arguments, so it can run on m_discoveryThread.
+    void runDiscovery(const sockaddr_in& configuredDest, std::vector<std::string>& devices, std::string& status);
     bool ensureNetworking();
 #ifdef _WIN32
     void sendDiscoveryQuery(SOCKET sock, const sockaddr_in& dest);
 #else
     void sendDiscoveryQuery(int sock, const sockaddr_in& dest);
 #endif
-    void collectBroadcastTargets(std::vector<sockaddr_in>& targets);
+    void collectBroadcastTargets(const sockaddr_in& configuredDest, std::vector<sockaddr_in>& targets,
+                                 std::vector<in_addr>& localUnicasts);
     bool parseStatusReply(const char* buffer, int length, const sockaddr_in& from, std::string& outInfo);
     void createRoutingTable();
+    void finishDiscoveryIfReady();
+    // Dock <name>_routing and <name>_info onto this CHOP, once they exist.
+    void dockCompanionDATs();
+    bool m_companionsDocked;
+    // Discover & Update pressed: apply results when background discovery finishes.
+    bool m_pendingTableUpdate;
+
+    // Auto-create the routing table once, when a new node is placed.
+    enum class AutoCreateState { Start, Discovering, BuildTable, Done };
+    AutoCreateState m_autoCreateState;
+    std::string m_autoCreateStatus;
+    void updateAutoCreate(const OP_Inputs* inputs);
+
+    // Background discovery hand-off
+    std::thread m_discoveryThread;
+    std::mutex m_discoveryMutex;
+    std::atomic<bool> m_discoveryDone;
+    std::vector<std::string> m_pendingDevices;
+    std::string m_pendingDiscoveryStatus;
     
     // FPS limiting
     double m_lastFrameTime;

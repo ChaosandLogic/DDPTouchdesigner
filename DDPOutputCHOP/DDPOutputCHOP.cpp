@@ -8,8 +8,6 @@
 #include <errno.h>
 #ifndef _WIN32
     #include <dlfcn.h>
-    #include <ifaddrs.h>
-    #include <net/if.h>
 #endif
 
 namespace
@@ -18,15 +16,6 @@ namespace
 // Python functions are looked up in the already-loaded TouchDesigner runtime instead of
 // linking against Python, so the plugin isn't tied to one Python version.
 // All of these are part of CPython's stable ABI.
-struct PythonApi
-{
-    PyObject* (*TupleNew)(intptr_t) = nullptr;
-    int (*TupleSetItem)(PyObject*, intptr_t, PyObject*) = nullptr;
-    PyObject* (*UnicodeFromString)(const char*) = nullptr;
-    void (*DecRef)(PyObject*) = nullptr;
-    PyObject* None = nullptr;
-};
-
 void* findPythonSymbol(const char* name)
 {
 #ifdef _WIN32
@@ -41,39 +30,197 @@ void* findPythonSymbol(const char* name)
 #endif
 }
 
-bool loadPythonApi(PythonApi& py)
+// Py_DecRef may be missing on some TouchDesigner Python builds; skip the release then.
+void pythonDecRef(PyObject* obj)
 {
-    py.TupleNew = reinterpret_cast<PyObject* (*)(intptr_t)>(findPythonSymbol("PyTuple_New"));
-    py.TupleSetItem = reinterpret_cast<int (*)(PyObject*, intptr_t, PyObject*)>(findPythonSymbol("PyTuple_SetItem"));
-    py.UnicodeFromString = reinterpret_cast<PyObject* (*)(const char*)>(findPythonSymbol("PyUnicode_FromString"));
-    py.DecRef = reinterpret_cast<void (*)(PyObject*)>(findPythonSymbol("Py_DecRef"));
-    py.None = reinterpret_cast<PyObject*>(findPythonSymbol("_Py_NoneStruct"));
-    return py.TupleNew && py.TupleSetItem && py.UnicodeFromString && py.DecRef && py.None;
+    using DecRefFn = void (*)(PyObject*);
+    DecRefFn decRef = reinterpret_cast<DecRefFn>(findPythonSymbol("Py_DecRef"));
+    if (decRef && obj)
+        decRef(obj);
 }
 
-const char* kCallbacksStub =
-    "# DDP Out callbacks\n"
-    "\n"
-    "def onCreateRoutingTable(ddpOut, devices):\n"
-    "\t\"\"\"Called by Create Routing Table.\n"
-    "\tdevices: tuple of IP strings found by discovery (may be empty).\n"
-    "\tCreates or updates <name>_routing next to the node and assigns it.\n"
-    "\tExisting rows are kept; newly found IPs are appended.\"\"\"\n"
-    "\tname = ddpOut.name + '_routing'\n"
-    "\ttable = ddpOut.parent().op(name)\n"
-    "\tif table is None:\n"
-    "\t\ttable = ddpOut.parent().create(tableDAT, name)\n"
-    "\t\ttable.nodeX = ddpOut.nodeX\n"
-    "\t\ttable.nodeY = ddpOut.nodeY - 200\n"
-    "\t\ttable.clear()\n"
-    "\tif table.numRows == 0:\n"
-    "\t\ttable.appendRow(['ip', 'pixels', 'port', 'start', 'active'])\n"
-    "\tknown = set(c.val for c in table.col(0)[1:])\n"
-    "\tfor ip in devices:\n"
-    "\t\tif ip not in known:\n"
-    "\t\t\ttable.appendRow([ip, '', '', '', 1])\n"
-    "\tddpOut.par.Routingtable = table\n"
-    "\treturn table\n";
+// Runs Python source in TouchDesigner's interpreter via builtins.exec, using only
+// stable-ABI functions (python3.dll on Windows). Errors are printed to the Textport.
+// Returns false if the functions couldn't be found or the code raised.
+bool execPython(const std::string& code)
+{
+    using GILEnsureFn = int (*)();
+    using GILReleaseFn = void (*)(int);
+    using ImportFn = PyObject* (*)(const char*);
+    using GetAttrFn = PyObject* (*)(PyObject*, const char*);
+    using FromStringFn = PyObject* (*)(const char*);
+    using DictNewFn = PyObject* (*)();
+    using CallArgsFn = PyObject* (*)(PyObject*, ...);
+    using ErrOccurredFn = PyObject* (*)();
+    using ErrPrintFn = void (*)();
+
+    auto gilEnsure = reinterpret_cast<GILEnsureFn>(findPythonSymbol("PyGILState_Ensure"));
+    auto gilRelease = reinterpret_cast<GILReleaseFn>(findPythonSymbol("PyGILState_Release"));
+    auto importModule = reinterpret_cast<ImportFn>(findPythonSymbol("PyImport_ImportModule"));
+    auto getAttr = reinterpret_cast<GetAttrFn>(findPythonSymbol("PyObject_GetAttrString"));
+    auto fromString = reinterpret_cast<FromStringFn>(findPythonSymbol("PyUnicode_FromString"));
+    auto dictNew = reinterpret_cast<DictNewFn>(findPythonSymbol("PyDict_New"));
+    auto callArgs = reinterpret_cast<CallArgsFn>(findPythonSymbol("PyObject_CallFunctionObjArgs"));
+    auto errOccurred = reinterpret_cast<ErrOccurredFn>(findPythonSymbol("PyErr_Occurred"));
+    auto errPrint = reinterpret_cast<ErrPrintFn>(findPythonSymbol("PyErr_Print"));
+    if (!gilEnsure || !gilRelease || !importModule || !getAttr || !fromString || !dictNew || !callArgs)
+        return false;
+
+    int gil = gilEnsure();
+    PyObject* builtins = importModule("builtins");
+    PyObject* execFn = builtins ? getAttr(builtins, "exec") : nullptr;
+    PyObject* source = fromString(code.c_str());
+    PyObject* globals = dictNew();
+    PyObject* result = (execFn && source && globals)
+        ? callArgs(execFn, source, globals, static_cast<PyObject*>(nullptr))
+        : nullptr;
+    bool ok = result != nullptr;
+    if (!ok && errOccurred && errPrint && errOccurred())
+        errPrint();
+    pythonDecRef(result);
+    pythonDecRef(globals);
+    pythonDecRef(source);
+    pythonDecRef(execFn);
+    pythonDecRef(builtins);
+    gilRelease(gil);
+    return ok;
+}
+
+std::string pyQuote(const std::string& text)
+{
+    std::string out = "'";
+    for (char c : text)
+    {
+        if (c == '\\' || c == '\'')
+        {
+            out += '\\';
+            out += c;
+        }
+        else if (c == '\n')
+            out += "\\n";
+        else
+            out += c;
+    }
+    return out + "'";
+}
+
+std::string pyStringList(const std::vector<std::string>& items)
+{
+    std::string out = "[";
+    for (size_t i = 0; i < items.size(); i++)
+    {
+        if (i > 0)
+            out += ", ";
+        out += pyQuote(items[i]);
+    }
+    return out + "]";
+}
+
+// Updates the assigned Routing Table (or creates <name>_routing): new IPs fill
+// rows with an empty ip cell first, then get appended. IPs already in the table
+// are left alone.
+#define DDP_UPDATE_TABLE_PY \
+    "def _updateRoutingTable(o, ips):\n" \
+    "    import td\n" \
+    "    t = o.par.Routingtable.eval()\n" \
+    "    if t is None or not t.isTable:\n" \
+    "        name = o.name + '_routing'\n" \
+    "        t = o.parent().op(name)\n" \
+    "        if t is None:\n" \
+    "            t = o.parent().create(td.tableDAT, name)\n" \
+    "            t.nodeX = o.nodeX\n" \
+    "            t.nodeY = o.nodeY - 200\n" \
+    "            t.clear()\n" \
+    "    if t.numRows == 0:\n" \
+    "        t.appendRow(['ip', 'pixels', 'start', 'active'])\n" \
+    "    head = [c.val.strip().lower() for c in t.row(0)]\n" \
+    "    ipNames = ('ip', 'netaddress', 'address', 'host')\n" \
+    "    hasHeader = any(h in ipNames for h in head)\n" \
+    "    ipc = next((i for i, h in enumerate(head) if h in ipNames), 0)\n" \
+    "    ac = next((i for i, h in enumerate(head) if h in ('active', 'enable', 'enabled')), -1) if hasHeader else -1\n" \
+    "    rows = range(1 if hasHeader else 0, t.numRows)\n" \
+    "    known = set(t[r, ipc].val.strip() for r in rows)\n" \
+    "    blanks = [r for r in rows if not t[r, ipc].val.strip()]\n" \
+    "    for ip in ips:\n" \
+    "        if not ip or ip in known:\n" \
+    "            continue\n" \
+    "        known.add(ip)\n" \
+    "        if blanks:\n" \
+    "            r = blanks.pop(0)\n" \
+    "            t[r, ipc] = ip\n" \
+    "            if ac >= 0 and not t[r, ac].val.strip():\n" \
+    "                t[r, ac] = 1\n" \
+    "        else:\n" \
+    "            row = [''] * max(t.numCols, ipc + 1)\n" \
+    "            row[ipc] = ip\n" \
+    "            if ac >= 0:\n" \
+    "                row[ac] = 1\n" \
+    "            t.appendRow(row)\n" \
+    "    o.par.Routingtable = t\n" \
+    "    return t\n"
+
+// Creates <name>_info (an Info DAT watching the node) unless one by that name
+// already exists. The caller docks it to the DDP Out.
+#define DDP_CREATE_INFO_PY \
+    "def _createInfoDAT(o):\n" \
+    "    import td\n" \
+    "    name = o.name + '_info'\n" \
+    "    i = o.parent().op(name)\n" \
+    "    if i is None:\n" \
+    "        i = o.parent().create(td.infoDAT, name)\n" \
+    "        i.nodeX = o.nodeX + 200\n" \
+    "        i.nodeY = o.nodeY - 200\n" \
+    "    i.par.op = o\n" \
+    "    return i\n"
+
+// Run one frame later via td.run(). args[0] = DDP Out path, args[1] = list of IPs,
+// args[2] = also create the Info DAT. Companion DATs named <chop>_routing and
+// <chop>_info are docked to the CHOP; a routing table from elsewhere is left put.
+const char* kBuildTableScript =
+    DDP_UPDATE_TABLE_PY
+    DDP_CREATE_INFO_PY
+    "def _dockToNode(child, parent):\n"
+    "    if child is None or child.parent() is not parent.parent():\n"
+    "        return\n"
+    "    child.dock = parent\n"
+    "    child.showDocked = True\n"
+    "o = op(args[0])\n"
+    "if o is not None:\n"
+    "    t = _updateRoutingTable(o, args[1])\n"
+    "    i = _createInfoDAT(o) if args[2] else o.parent().op(o.name + '_info')\n"
+    "    if t is not None and t.name == o.name + '_routing':\n"
+    "        _dockToNode(t, o)\n"
+    "    _dockToNode(i, o)\n";
+
+// onlyOnce: skip if this node already auto-created a table (flag in its storage),
+// so reopening a project never recreates one. The auto-create path also adds
+// the Info DAT. Either path docks the companion DATs onto the CHOP.
+std::string buildRoutingTableExec(const std::string& opPath, const std::vector<std::string>& ips, bool onlyOnce)
+{
+    std::string code = "import td\n"
+                       "_o = td.op(" + pyQuote(opPath) + ")\n"
+                       "if _o is not None";
+    if (onlyOnce)
+        code += " and not _o.fetch('ddpRoutingInit', False, search=False)";
+    code += ":\n";
+    if (onlyOnce)
+        code += "    _o.store('ddpRoutingInit', True)\n";
+    code += "    td.run(" + pyQuote(kBuildTableScript) + ", _o.path, " + pyStringList(ips) + ", "
+          + (onlyOnce ? "True" : "False") + ", delayFrames=1)\n";
+    return code;
+}
+
+std::vector<std::string> ipsOnly(const std::vector<std::string>& entries)
+{
+    // Entries may be "ip", "ip:port", or "ip (man mod)".
+    std::vector<std::string> ips;
+    for (const std::string& entry : entries)
+    {
+        size_t end = entry.find_first_of(" :");
+        ips.push_back(entry.substr(0, end == std::string::npos ? entry.size() : end));
+    }
+    return ips;
+}
 
 std::string lowerCopy(const char* s)
 {
@@ -139,7 +286,6 @@ enum class ColKind
     None,
     Ip,
     Pixels,
-    Port,
     Start,
     Active
 };
@@ -151,8 +297,6 @@ ColKind columnKind(const char* name)
         return ColKind::Ip;
     if (n == "pixels" || n == "pixel" || n == "length" || n == "count" || n == "numpixels")
         return ColKind::Pixels;
-    if (n == "port")
-        return ColKind::Port;
     if (n == "start" || n == "offset" || n == "pixelstart")
         return ColKind::Start;
     if (n == "active" || n == "enable" || n == "enabled")
@@ -174,14 +318,19 @@ extern "C"
         info->customOPInfo.opLabel->setString("DDP Out");
         info->customOPInfo.authorName->setString("Glen Wilde");
         info->customOPInfo.authorEmail->setString("Glen.w.wilde@gmail.com");
-        info->customOPInfo.minInputs = 1;
+        // 0, not 1: a node with no input wired must still cook, or the
+        // auto-create step for a freshly placed node never runs.
+        info->customOPInfo.minInputs = 0;
         info->customOPInfo.maxInputs = 1;
         
         // Ensure the node cooks on startup (important for output nodes)
         info->customOPInfo.cookOnStart = true;
 
-        info->customOPInfo.pythonCallbacksDAT = kCallbacksStub;
-        info->customOPInfo.minorVersion = 3;
+        // No Callbacks DAT parameter. Routing-table updates run the built-in script.
+        // Bump minorVersion so existing nodes drop removed parameters
+        // (Callbacks DAT, Port, Auto Push, Discover).
+        info->customOPInfo.pythonCallbacksDAT = nullptr;
+        info->customOPInfo.minorVersion = 6;
     }
 
     DLLEXPORT CHOP_CPlusPlusBase* CreateCHOPInstance(const OP_NodeInfo* info)
@@ -206,8 +355,8 @@ DDPOutputCHOP::DDPOutputCHOP(const OP_NodeInfo* info) : myNodeInfo(info)
     m_lastChannelCount = 0;
     m_lastPixelCount = 0;
     m_routeCount = 0;
-    m_lastPort = 0;
     m_showStats = false;
+    m_companionsDocked = false;
     m_isDiscovering = false;
     m_lastFrameTime = 0.0;
     m_lastSendError = 0;
@@ -215,6 +364,10 @@ DDPOutputCHOP::DDPOutputCHOP(const OP_NodeInfo* info) : myNodeInfo(info)
     m_stopSender = false;
     m_framesDropped = 0;
     m_frameIntervalSec = 1.0 / 60.0;
+    m_discoveryDone = false;
+    m_pendingTableUpdate = false;
+    m_autoCreateState = AutoCreateState::Start;
+    m_autoCreateStatus = "Not started (node hasn't cooked yet)";
     
     #ifdef _WIN32
         m_socket = INVALID_SOCKET;
@@ -238,6 +391,10 @@ DDPOutputCHOP::~DDPOutputCHOP()
     m_frameCv.notify_all();
     if (m_senderThread.joinable())
         m_senderThread.join();
+
+    // Discovery finishes on its own within ~600 ms.
+    if (m_discoveryThread.joinable())
+        m_discoveryThread.join();
 
     closeSocket();
 }
@@ -295,22 +452,8 @@ void DDPOutputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved
         assert(res == OP_ParAppendResult::Success);
     }
     
-    // Port
-    {
-        OP_NumericParameter np;
-        np.name = "Port";
-        np.label = "Port";
-        np.defaultValues[0] = DDP_PORT;
-        np.minSliders[0] = 1;
-        np.maxSliders[0] = 65535;
-        np.minValues[0] = 1;
-        np.maxValues[0] = 65535;
-        OP_ParAppendResult res = manager->appendInt(np);
-        assert(res == OP_ParAppendResult::Success);
-    }
-
     // Optional table DAT. Empty = send the whole input to IP Address.
-    // Columns: ip, pixels, and optional port, start, active.
+    // Columns: ip, pixels, and optional start, active.
     {
         OP_StringParameter sp;
         sp.name = "Routingtable";
@@ -375,16 +518,6 @@ void DDPOutputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved
         assert(res == OP_ParAppendResult::Success);
     }
     
-    // Auto Push (for single device vs multi-device sync)
-    {
-        OP_NumericParameter np;
-        np.name = "Autopush";
-        np.label = "Auto Push";
-        np.defaultValues[0] = 1;
-        OP_ParAppendResult res = manager->appendToggle(np);
-        assert(res == OP_ParAppendResult::Success);
-    }
-    
     // Show Stats Toggle
     {
         OP_NumericParameter np;
@@ -425,20 +558,12 @@ void DDPOutputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved
         assert(res == OP_ParAppendResult::Success);
     }
 
-    // Discover Devices Button
-    {
-        OP_NumericParameter np;
-        np.name = "Discover";
-        np.label = "Discover Devices";
-        OP_ParAppendResult res = manager->appendPulse(np);
-        assert(res == OP_ParAppendResult::Success);
-    }
-    
-    // Create Routing Table Button
+    // Discover & Update Routing Table Button. Name kept as "Createtable" so
+    // existing projects and scripts that pulse it keep working.
     {
         OP_NumericParameter np;
         np.name = "Createtable";
-        np.label = "Create Routing Table";
+        np.label = "Discover & Update Routing Table";
         OP_ParAppendResult res = manager->appendPulse(np);
         assert(res == OP_ParAppendResult::Success);
     }
@@ -446,11 +571,7 @@ void DDPOutputCHOP::setupParameters(OP_ParameterManager* manager, void* reserved
 
 void DDPOutputCHOP::pulsePressed(const char* name, void* reserved1)
 {
-    if (strcmp(name, "Discover") == 0)
-    {
-        discoverDevices();
-    }
-    else if (strcmp(name, "Createtable") == 0)
+    if (strcmp(name, "Createtable") == 0)
     {
         createRoutingTable();
     }
@@ -458,337 +579,54 @@ void DDPOutputCHOP::pulsePressed(const char* name, void* reserved1)
 
 void DDPOutputCHOP::createRoutingTable()
 {
-    discoverDevices();
+    // Must not block the cook thread: DDP In on this same process only replies
+    // when it cooks, so a synchronous wait would miss local devices.
+    m_pendingTableUpdate = true;
+    const bool inFlight = m_discoveryThread.joinable() || m_discoveryDone;
+    if (!inFlight)
+        startAsyncDiscovery();
+    m_lastError = "Discovering devices...";
+}
 
-    PythonApi py;
-    if (!loadPythonApi(py))
-    {
-        m_lastError = "Create Routing Table: TouchDesigner's Python runtime was not found";
+void DDPOutputCHOP::finishDiscoveryIfReady()
+{
+    if (!collectAsyncDiscovery())
         return;
-    }
 
-    OP_Context* context = myNodeInfo->context;
-    PyObject* args = context ? context->createArgumentsTuple(1, nullptr) : nullptr;
-    if (!args)
-    {
-        m_lastError = "Create Routing Table: could not create Python arguments";
+    if (m_autoCreateState == AutoCreateState::Discovering)
+        m_autoCreateState = AutoCreateState::BuildTable;
+
+    if (!m_pendingTableUpdate)
         return;
-    }
 
-    // Entries may be "ip", "ip:port", or "ip (man mod)". Pass the IP only.
-    PyObject* devices = py.TupleNew(static_cast<intptr_t>(m_discoveredDevices.size()));
-    for (size_t i = 0; i < m_discoveredDevices.size(); i++)
-    {
-        const std::string& entry = m_discoveredDevices[i];
-        size_t end = entry.find_first_of(" :");
-        std::string ip = entry.substr(0, end == std::string::npos ? entry.size() : end);
-        py.TupleSetItem(devices, static_cast<intptr_t>(i), py.UnicodeFromString(ip.c_str()));
-    }
-    py.TupleSetItem(args, 1, devices);
-
-    PyObject* result = context->callPythonCallback("onCreateRoutingTable", args, nullptr, nullptr);
-    py.DecRef(args);
-
-    if (!result)
-    {
-        m_lastError = "Create Routing Table: onCreateRoutingTable raised an error (see Textport)";
-        return;
-    }
-    if (result == py.None)
-        m_lastError = "Create Routing Table: no Callbacks DAT with onCreateRoutingTable() is set";
+    m_pendingTableUpdate = false;
+    std::string code = buildRoutingTableExec(myNodeInfo->opPath, ipsOnly(m_discoveredDevices), false);
+    if (execPython(code))
+        m_lastError = "Routing table updated with " + std::to_string(m_discoveredDevices.size()) + " discovered device(s)";
     else
-        m_lastError = "Routing table created with " + std::to_string(m_discoveredDevices.size()) + " discovered device(s)";
-    py.DecRef(result);
+        m_lastError = "Discover & Update Routing Table: could not run Python (see Textport)";
 }
 
-bool DDPOutputCHOP::ensureNetworking()
+void DDPOutputCHOP::dockCompanionDATs()
 {
-    #ifdef _WIN32
-    if (!m_wsaInitialized)
-    {
-        WSADATA wsaData;
-        int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-        if (result != 0)
-        {
-            m_lastError = "WSAStartup failed";
-            return false;
-        }
-        m_wsaInitialized = true;
-    }
-    #endif
-    return true;
-}
-
-void DDPOutputCHOP::initializeSocket()
-{
-    std::lock_guard<std::mutex> lock(m_socketMutex);
-    if (m_socketInitialized)
+    if (m_companionsDocked || !myNodeInfo)
         return;
 
-    if (!ensureNetworking())
-        return;
-
-    int sendBufferBytes = DDP_SEND_BUFFER_BYTES;
-    
-    #ifdef _WIN32
-    m_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (m_socket == INVALID_SOCKET)
-    {
-        m_lastError = "Socket creation failed";
-        return;
-    }
-    
-    // Enable address reuse (allows binding even if port is in use)
-    BOOL reuseAddr = TRUE;
-    setsockopt(m_socket, SOL_SOCKET, SO_REUSEADDR, (char*)&reuseAddr, sizeof(reuseAddr));
-    
-    // Enable broadcast
-    BOOL broadcastEnable = TRUE;
-    setsockopt(m_socket, SOL_SOCKET, SO_BROADCAST, (char*)&broadcastEnable, sizeof(broadcastEnable));
-
-    setsockopt(m_socket, SOL_SOCKET, SO_SNDBUF, (char*)&sendBufferBytes, sizeof(sendBufferBytes));
-    
-    // Bind to any local address on DDP port to receive broadcast responses
-    struct sockaddr_in localAddr;
-    memset(&localAddr, 0, sizeof(localAddr));
-    localAddr.sin_family = AF_INET;
-    localAddr.sin_addr.s_addr = INADDR_ANY;
-    localAddr.sin_port = htons(0);  // Use ephemeral port for sending, but we'll listen on this socket
-    
-    if (bind(m_socket, (struct sockaddr*)&localAddr, sizeof(localAddr)) == SOCKET_ERROR)
-    {
-        m_lastError = "Socket bind failed";
-        closesocket(m_socket);
-        m_socket = INVALID_SOCKET;
-        return;
-    }
-    
-    #else
-    m_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (m_socket < 0)
-    {
-        int error = errno;
-        m_lastError = "Socket creation failed, errno " + std::to_string(error) + ": " + strerror(error);
-        return;
-    }
-    
-    // Enable address reuse (allows binding even if port is in use)
-    int reuseAddr = 1;
-    setsockopt(m_socket, SOL_SOCKET, SO_REUSEADDR, &reuseAddr, sizeof(reuseAddr));
-    
-    // Enable broadcast
-    int broadcastEnable = 1;
-    setsockopt(m_socket, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
-
-    setsockopt(m_socket, SOL_SOCKET, SO_SNDBUF, &sendBufferBytes, sizeof(sendBufferBytes));
-    
-    // Bind to any local address on DDP port to receive broadcast responses
-    struct sockaddr_in localAddr;
-    memset(&localAddr, 0, sizeof(localAddr));
-    localAddr.sin_family = AF_INET;
-    localAddr.sin_addr.s_addr = INADDR_ANY;
-    localAddr.sin_port = htons(0);  // Use ephemeral port for sending, but we'll listen on this socket
-    
-    if (bind(m_socket, (struct sockaddr*)&localAddr, sizeof(localAddr)) < 0)
-    {
-        int error = errno;
-        m_lastError = "Socket bind failed, errno " + std::to_string(error) + ": " + strerror(error);
-        close(m_socket);
-        m_socket = -1;
-        return;
-    }
-    #endif
-    
-    m_socketInitialized = true;
-    m_lastError = "Socket initialized successfully";
+    // Companion DATs from an earlier session are already in the network.
+    // Ones created later are docked by the table script itself.
+    std::string code =
+        "import td\n"
+        "_o = td.op(" + pyQuote(myNodeInfo->opPath) + ")\n"
+        "if _o is not None:\n"
+        "    for _suffix in ('_routing', '_info'):\n"
+        "        _d = _o.parent().op(_o.name + _suffix)\n"
+        "        if _d is not None and _d.parent() is _o.parent():\n"
+        "            _d.dock = _o\n"
+        "            _d.showDocked = True\n";
+    if (execPython(code))
+        m_companionsDocked = true;
 }
 
-void DDPOutputCHOP::closeSocket()
-{
-    std::lock_guard<std::mutex> lock(m_socketMutex);
-    if (m_socketInitialized)
-    {
-        #ifdef _WIN32
-            closesocket(m_socket);
-            if (m_wsaInitialized)
-            {
-                WSACleanup();
-                m_wsaInitialized = false;
-            }
-        #else
-            close(m_socket);
-        #endif
-        
-        m_socketInitialized = false;
-    }
-}
-
-void DDPOutputCHOP::createDDPPacket(const uint8_t* pixelData, size_t dataLength, 
-                                     size_t offset, bool pushFlag, std::vector<uint8_t>& packet)
-{
-    packet.resize(DDP_HEADER_SIZE + dataLength);
-    
-    // Byte 0: Flags (Version 1, optional PUSH flag)
-    packet[0] = DDP_FLAGS1_VER1;
-    if (pushFlag)
-        packet[0] |= DDP_FLAGS1_PUSH;
-    
-    // Byte 1: Sequence number. 0 = unused (DDP spec). Non-zero values trip WLED's
-    // "skip out-of-sequence" filter on larger frames and cause flicker.
-    packet[1] = 0;
-    
-    // Byte 2: Data type
-    packet[2] = m_dataType;
-    
-    // Byte 3: Destination ID (Display)
-    packet[3] = DDP_ID_DISPLAY;
-    
-    // Bytes 4-7: Data offset (32-bit big-endian)
-    uint32_t offset32 = static_cast<uint32_t>(offset);
-    packet[4] = (offset32 >> 24) & 0xFF;
-    packet[5] = (offset32 >> 16) & 0xFF;
-    packet[6] = (offset32 >> 8) & 0xFF;
-    packet[7] = offset32 & 0xFF;
-    
-    // Bytes 8-9: Data length (16-bit big-endian)
-    uint16_t length16 = static_cast<uint16_t>(dataLength);
-    packet[8] = (length16 >> 8) & 0xFF;
-    packet[9] = length16 & 0xFF;
-    
-    // Copy pixel data
-    std::memcpy(&packet[DDP_HEADER_SIZE], pixelData, dataLength);
-}
-
-void DDPOutputCHOP::sendPacket(const std::vector<uint8_t>& packet, const sockaddr_in& dest)
-{
-    int sendResult = sendto(m_socket,
-                           reinterpret_cast<const char*>(packet.data()),
-                           static_cast<int>(packet.size()),
-                           0,
-                           reinterpret_cast<const struct sockaddr*>(&dest),
-                           sizeof(dest));
-
-    if (sendResult > 0 && m_showStats)
-    {
-        m_packetsSent++;
-        m_bytesSent += sendResult;
-    }
-    else if (sendResult < 0)
-    {
-        #ifdef _WIN32
-            m_lastSendError = WSAGetLastError();
-        #else
-            m_lastSendError = errno;
-        #endif
-    }
-}
-
-void DDPOutputCHOP::sendPushPacketTo(const sockaddr_in& dest)
-{
-    // PUSH packet with no data (just header). Sequence 0 = unused.
-    m_packetBuffer.assign(DDP_HEADER_SIZE, 0);
-    m_packetBuffer[0] = DDP_FLAGS1_VER1 | DDP_FLAGS1_PUSH;
-    m_packetBuffer[1] = 0;
-    m_packetBuffer[2] = m_dataType;
-    m_packetBuffer[3] = DDP_ID_DISPLAY;
-
-    sendPacket(m_packetBuffer, dest);
-}
-
-void DDPOutputCHOP::sendFrame(const SendFrame& frame)
-{
-    std::lock_guard<std::mutex> lock(m_socketMutex);
-    if (!m_socketInitialized || frame.pixels.empty() || frame.routes.empty())
-        return;
-
-    using Clock = std::chrono::steady_clock;
-
-    // Pace between controllers, not between packets to the same one.
-    // Spreading one device's packets over tens of ms makes partial-frame flashes
-    // much more likely if the receiver updates before it has seen a PUSH.
-    const size_t routeCount = frame.routes.size();
-    const bool paceRoutes = frame.pacingWindowSec > 0.0 && routeCount > 1;
-    const Clock::time_point start = Clock::now();
-    const Clock::duration window = std::chrono::duration_cast<Clock::duration>(
-        std::chrono::duration<double>(frame.pacingWindowSec));
-
-    for (size_t routeIndex = 0; routeIndex < routeCount; routeIndex++)
-    {
-        if (paceRoutes)
-        {
-            Clock::time_point due = start + window * static_cast<Clock::rep>(routeIndex)
-                / static_cast<Clock::rep>(routeCount);
-            if (due - Clock::now() >= std::chrono::milliseconds(1))
-                std::this_thread::sleep_until(due);
-        }
-
-        const DeviceRoute& route = frame.routes[routeIndex];
-        const uint8_t* data = frame.pixels.data() + route.byteOffset;
-        size_t bytesSent = 0;
-
-        // Each controller gets a tight burst, with PUSH on its last data packet.
-        // Empty PUSH packets are easy to lose and leave the display frozen or flashing.
-        while (bytesSent < route.byteCount)
-        {
-            size_t bytesInPacket = std::min(route.byteCount - bytesSent, static_cast<size_t>(DDP_MAX_DATALEN));
-            bool isLastPacket = (bytesSent + bytesInPacket >= route.byteCount);
-            createDDPPacket(data + bytesSent, bytesInPacket, bytesSent,
-                            frame.autoPush && isLastPacket, m_packetBuffer);
-            sendPacket(m_packetBuffer, route.addr);
-            bytesSent += bytesInPacket;
-        }
-    }
-}
-
-void DDPOutputCHOP::senderLoop()
-{
-    #ifdef _WIN32
-        // 1 ms sleep resolution for pacing; the default is ~15.6 ms.
-        timeBeginPeriod(1);
-    #endif
-
-    SendFrame frame;
-    while (true)
-    {
-        {
-            std::unique_lock<std::mutex> lock(m_frameMutex);
-            m_frameCv.wait(lock, [this] { return m_stopSender || m_hasPendingFrame; });
-            if (m_stopSender)
-                break;
-            std::swap(frame, m_pendingFrame);
-            m_hasPendingFrame = false;
-        }
-        sendFrame(frame);
-    }
-
-    #ifdef _WIN32
-        timeEndPeriod(1);
-    #endif
-}
-
-void DDPOutputCHOP::submitFrame(std::vector<DeviceRoute>& routes, bool autoPush)
-{
-    auto now = std::chrono::steady_clock::now();
-    double interval = std::chrono::duration<double>(now - m_lastSubmitTime).count();
-    m_lastSubmitTime = now;
-    if (interval > 0.0 && interval < 1.0)
-        m_frameIntervalSec = 0.8 * m_frameIntervalSec + 0.2 * interval;
-
-    double window = std::min(m_frameIntervalSec * DDP_PACING_WINDOW_FRACTION, DDP_PACING_MAX_WINDOW_SEC);
-
-    {
-        std::lock_guard<std::mutex> lock(m_frameMutex);
-        if (m_hasPendingFrame)
-            m_framesDropped++;
-        // Swap so both buffers keep their capacity and nothing is reallocated per frame.
-        std::swap(m_pendingFrame.pixels, m_workPixels);
-        std::swap(m_pendingFrame.routes, routes);
-        m_pendingFrame.autoPush = autoPush;
-        m_pendingFrame.pacingWindowSec = window;
-        m_hasPendingFrame = true;
-    }
-    m_frameCv.notify_one();
-}
 
 uint8_t DDPOutputCHOP::floatToUint8(float value, bool normalizedInput)
 {
@@ -908,9 +746,10 @@ bool DDPOutputCHOP::parseRoutingTable(const OP_Inputs* inputs, int channelsPerPi
     if (!table || !table->isTable || table->numRows <= 0 || table->numCols <= 0)
         return false;
 
+    // Headerless tables: column 2 is skipped (it used to be port) so older
+    // tables keep start in column 3.
     int ipCol = 0;
     int pixCol = 1;
-    int portCol = 2;
     int startCol = 3;
     int activeCol = -1;
     int firstRow = 0;
@@ -929,7 +768,6 @@ bool DDPOutputCHOP::parseRoutingTable(const OP_Inputs* inputs, int channelsPerPi
     {
         ipCol = -1;
         pixCol = -1;
-        portCol = -1;
         startCol = -1;
         for (int col = 0; col < table->numCols; col++)
         {
@@ -937,7 +775,6 @@ bool DDPOutputCHOP::parseRoutingTable(const OP_Inputs* inputs, int channelsPerPi
             {
                 case ColKind::Ip: ipCol = col; break;
                 case ColKind::Pixels: pixCol = col; break;
-                case ColKind::Port: portCol = col; break;
                 case ColKind::Start: startCol = col; break;
                 case ColKind::Active: activeCol = col; break;
                 default: break;
@@ -953,22 +790,12 @@ bool DDPOutputCHOP::parseRoutingTable(const OP_Inputs* inputs, int channelsPerPi
     else if (table->numCols < 2)
     {
         pixCol = -1;
-        portCol = -1;
-        startCol = -1;
-    }
-    else if (table->numCols < 3)
-    {
-        portCol = -1;
         startCol = -1;
     }
     else if (table->numCols < 4)
     {
         startCol = -1;
     }
-
-    int defaultPort = inputs->getParInt("Port");
-    if (defaultPort < 1 || defaultPort > 65535)
-        defaultPort = DDP_PORT;
 
     size_t cpp = static_cast<size_t>(std::max(1, channelsPerPixel));
     size_t totalPixels = dataBytes / cpp;
@@ -1004,14 +831,7 @@ bool DDPOutputCHOP::parseRoutingTable(const OP_Inputs* inputs, int channelsPerPi
             continue;
         }
 
-        int port = defaultPort;
-        long parsedPort = 0;
-        if (portCol >= 0 && parseNonNegInt(cellText(table, row, portCol), parsedPort) &&
-            parsedPort >= 1 && parsedPort <= 65535)
-        {
-            port = static_cast<int>(parsedPort);
-        }
-        route.addr.sin_port = htons(static_cast<uint16_t>(port));
+        route.addr.sin_port = htons(DDP_PORT);
 
         bool hasStart = false;
         long startPix = 0;
@@ -1020,7 +840,8 @@ bool DDPOutputCHOP::parseRoutingTable(const OP_Inputs* inputs, int channelsPerPi
 
         bool hasCount = false;
         long countPix = 0;
-        if (pixCol >= 0 && parseNonNegInt(cellText(table, row, pixCol), countPix) && countPix > 0)
+        // 0 is a real count (send nothing). Only a blank cell means "the rest".
+        if (pixCol >= 0 && parseNonNegInt(cellText(table, row, pixCol), countPix))
             hasCount = true;
 
         // No pixels column means every row gets the same stream (or from `start` to the end).
@@ -1061,16 +882,65 @@ bool DDPOutputCHOP::parseRoutingTable(const OP_Inputs* inputs, int channelsPerPi
     return true;
 }
 
+void DDPOutputCHOP::updateAutoCreate(const OP_Inputs* inputs)
+{
+    switch (m_autoCreateState)
+    {
+        case AutoCreateState::Start:
+        {
+            // Only a freshly placed node looks like this: no table, no input, default IP.
+            // A configured node in an existing project fails at least one check.
+            const char* tablePath = inputs->getParString("Routingtable");
+            const char* ip = inputs->getParString("Ipaddress");
+            if (tablePath && tablePath[0])
+            {
+                m_autoCreateState = AutoCreateState::Done;
+                m_autoCreateStatus = std::string("Skipped: Routing Table already set (") + tablePath + ")";
+                break;
+            }
+            if (inputs->getInputCHOP(0))
+            {
+                m_autoCreateState = AutoCreateState::Done;
+                m_autoCreateStatus = "Skipped: input already connected (existing node)";
+                break;
+            }
+            if (!ip || std::strcmp(ip, "127.0.0.1") != 0)
+            {
+                m_autoCreateState = AutoCreateState::Done;
+                m_autoCreateStatus = "Skipped: IP Address already changed (existing node)";
+                break;
+            }
+            startAsyncDiscovery();
+            m_autoCreateState = AutoCreateState::Discovering;
+            m_autoCreateStatus = "Discovering devices";
+            break;
+        }
+        case AutoCreateState::Discovering:
+            break;
+        case AutoCreateState::BuildTable:
+        {
+            m_autoCreateState = AutoCreateState::Done;
+            std::string code = buildRoutingTableExec(myNodeInfo->opPath, ipsOnly(m_discoveredDevices), true);
+            if (execPython(code))
+                m_autoCreateStatus = "Routing table and Info DAT requested with " + std::to_string(m_discoveredDevices.size())
+                    + " discovered device(s) (skipped if this node already did it once)";
+            else
+                m_autoCreateStatus = "Could not run Python to create the table (see Textport)";
+            break;
+        }
+        case AutoCreateState::Done:
+            break;
+    }
+}
+
 void DDPOutputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved1)
 {
     // Get parameters
     const char* ipAddress = inputs->getParString("Ipaddress");
-    int port = inputs->getParInt("Port");
     bool enabled = inputs->getParInt("Enable") != 0;
     float gamma = static_cast<float>(inputs->getParDouble("Gamma"));
     float brightness = static_cast<float>(inputs->getParDouble("Brightness"));
     int channelsPerPixel = channelsPerPixelFromInputs(inputs);
-    bool autoPush = inputs->getParInt("Autopush") != 0;
     bool showStats = inputs->getParInt("Showstats") != 0;
     double maxFPS = inputs->getParDouble("Maxfps");
     const char* valueRange = inputs->getParString("Valuerange");
@@ -1084,6 +954,10 @@ void DDPOutputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* 
         m_bytesSent = 0;
     }
     m_showStats = showStats;
+
+    finishDiscoveryIfReady();
+    updateAutoCreate(inputs);
+    dockCompanionDATs();
 
     int sendError = m_lastSendError.exchange(0);
     if (sendError != 0)
@@ -1112,13 +986,12 @@ void DDPOutputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* 
         return;
     }
     
-    // Check if we need to reinitialize socket (IP or port changed)
+    // Check if we need to reinitialize socket (IP changed)
     bool needsReinit = false;
-    if (m_lastIPAddress != ipAddress || m_lastPort != port)
+    if (m_lastIPAddress != ipAddress)
     {
         needsReinit = true;
         m_lastIPAddress = ipAddress;
-        m_lastPort = port;
     }
     
     if (needsReinit && m_socketInitialized)
@@ -1134,7 +1007,7 @@ void DDPOutputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* 
         // Setup destination address
         memset(&m_destAddr, 0, sizeof(m_destAddr));
         m_destAddr.sin_family = AF_INET;
-        m_destAddr.sin_port = htons(port);
+        m_destAddr.sin_port = htons(DDP_PORT);
         inet_pton(AF_INET, ipAddress, &m_destAddr.sin_addr);
     }
     
@@ -1181,7 +1054,7 @@ void DDPOutputCHOP::execute(CHOP_Output* output, const OP_Inputs* inputs, void* 
             route.byteCount = m_workPixels.size();
             routes.push_back(route);
         }
-        submitFrame(routes, autoPush);
+        submitFrame(routes);
     }
 
     output->channels[1][0] = static_cast<float>(m_packetsSent);
@@ -1225,7 +1098,7 @@ void DDPOutputCHOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void* 
 
 bool DDPOutputCHOP::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1)
 {
-    infoSize->rows = 9 + static_cast<int32_t>(m_discoveredDevices.size());
+    infoSize->rows = 3 + static_cast<int32_t>(m_discoveredDevices.size());
     infoSize->cols = 2;
     infoSize->byColumn = false;
     return true;
@@ -1236,45 +1109,15 @@ void DDPOutputCHOP::getInfoDATEntries(int32_t index, int32_t nEntries,
 {
     if (index == 0)
     {
-        entries->values[0]->setString("Packets Sent");
-        entries->values[1]->setString(std::to_string(m_packetsSent.load()).c_str());
-    }
-    else if (index == 1)
-    {
-        entries->values[0]->setString("Bytes Sent");
-        entries->values[1]->setString(std::to_string(m_bytesSent.load()).c_str());
-    }
-    else if (index == 2)
-    {
-        entries->values[0]->setString("Channel Count");
-        entries->values[1]->setString(std::to_string(m_lastChannelCount).c_str());
-    }
-    else if (index == 3)
-    {
-        entries->values[0]->setString("Pixel Count");
-        entries->values[1]->setString(std::to_string(m_lastPixelCount).c_str());
-    }
-    else if (index == 4)
-    {
-        entries->values[0]->setString("Routes");
-        entries->values[1]->setString(std::to_string(m_routeCount).c_str());
-    }
-    else if (index == 5)
-    {
-        entries->values[0]->setString("IP Address");
-        entries->values[1]->setString(m_lastIPAddress.c_str());
-    }
-    else if (index == 6)
-    {
-        entries->values[0]->setString("Last Error");
+        entries->values[0]->setString("Last Status");
         entries->values[1]->setString(m_lastError.c_str());
     }
-    else if (index == 7)
+    else if (index == 1)
     {
         entries->values[0]->setString("Devices Found");
         entries->values[1]->setString(std::to_string(m_discoveredDevices.size()).c_str());
     }
-    else if (index == 8)
+    else if (index == 2)
     {
         // Frames replaced before the sender thread got to them (network can't keep up).
         int64_t dropped;
@@ -1285,372 +1128,11 @@ void DDPOutputCHOP::getInfoDATEntries(int32_t index, int32_t nEntries,
         entries->values[0]->setString("Frames Dropped");
         entries->values[1]->setString(std::to_string(dropped).c_str());
     }
-    else if (index >= 9 && index < 9 + static_cast<int32_t>(m_discoveredDevices.size()))
+    else if (index >= 3 && index < 3 + static_cast<int32_t>(m_discoveredDevices.size()))
     {
-        int deviceIdx = index - 9;
+        int deviceIdx = index - 3;
         entries->values[0]->setString(("Device " + std::to_string(deviceIdx + 1)).c_str());
         entries->values[1]->setString(m_discoveredDevices[deviceIdx].c_str());
     }
-}
-
-#ifdef _WIN32
-void DDPOutputCHOP::sendDiscoveryQuery(SOCKET sock, const sockaddr_in& dest)
-#else
-void DDPOutputCHOP::sendDiscoveryQuery(int sock, const sockaddr_in& dest)
-#endif
-{
-    // DDP JSON Status read (ID 251). Length is bytes requested, not payload size.
-    uint8_t packet[DDP_HEADER_SIZE] = {};
-    packet[0] = DDP_FLAGS1_VER1 | DDP_FLAGS1_QUERY;
-    packet[1] = 0;
-    packet[2] = 0;
-    packet[3] = DDP_ID_STATUS;
-    packet[8] = static_cast<uint8_t>((DDP_STATUS_QUERY_LEN >> 8) & 0xFF);
-    packet[9] = static_cast<uint8_t>(DDP_STATUS_QUERY_LEN & 0xFF);
-
-    sendto(sock,
-           reinterpret_cast<const char*>(packet),
-           DDP_HEADER_SIZE,
-           0,
-           reinterpret_cast<const struct sockaddr*>(&dest),
-           sizeof(dest));
-}
-
-void DDPOutputCHOP::collectBroadcastTargets(std::vector<sockaddr_in>& targets)
-{
-    auto addTarget = [&targets](in_addr addr)
-    {
-        if (addr.s_addr == 0 || addr.s_addr == htonl(INADDR_LOOPBACK))
-            return;
-        for (const sockaddr_in& existing : targets)
-        {
-            if (existing.sin_addr.s_addr == addr.s_addr)
-                return;
-        }
-        sockaddr_in dest;
-        memset(&dest, 0, sizeof(dest));
-        dest.sin_family = AF_INET;
-        dest.sin_port = htons(DDP_PORT);
-        dest.sin_addr = addr;
-        targets.push_back(dest);
-    };
-
-    // Global broadcast (some networks block this; subnet broadcasts below cover most cases).
-    in_addr globalBroadcast;
-    globalBroadcast.s_addr = htonl(INADDR_BROADCAST);
-    addTarget(globalBroadcast);
-
-    #ifdef _WIN32
-    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
-    ULONG bufLen = 15000;
-    std::vector<uint8_t> buffer(bufLen);
-    PIP_ADAPTER_ADDRESSES adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-    ULONG result = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &bufLen);
-    if (result == ERROR_BUFFER_OVERFLOW)
-    {
-        buffer.resize(bufLen);
-        adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-        result = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &bufLen);
-    }
-    if (result == NO_ERROR)
-    {
-        for (PIP_ADAPTER_ADDRESSES adapter = adapters; adapter; adapter = adapter->Next)
-        {
-            if (adapter->OperStatus != IfOperStatusUp)
-                continue;
-            for (PIP_ADAPTER_UNICAST_ADDRESS unicast = adapter->FirstUnicastAddress; unicast; unicast = unicast->Next)
-            {
-                if (!unicast->Address.lpSockaddr || unicast->Address.lpSockaddr->sa_family != AF_INET)
-                    continue;
-                auto* sa = reinterpret_cast<sockaddr_in*>(unicast->Address.lpSockaddr);
-                ULONG prefix = unicast->OnLinkPrefixLength;
-                if (prefix == 0 || prefix > 30)
-                    prefix = 24;
-                uint32_t ip = ntohl(sa->sin_addr.s_addr);
-                uint32_t mask = prefix == 0 ? 0 : (0xFFFFFFFFu << (32 - prefix));
-                in_addr bcast;
-                bcast.s_addr = htonl((ip & mask) | ~mask);
-                addTarget(bcast);
-            }
-        }
-    }
-    #else
-    struct ifaddrs* ifaddr = nullptr;
-    if (getifaddrs(&ifaddr) == 0)
-    {
-        for (struct ifaddrs* ifa = ifaddr; ifa; ifa = ifa->ifa_next)
-        {
-            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
-                continue;
-            if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
-                continue;
-            if (ifa->ifa_flags & IFF_BROADCAST && ifa->ifa_broadaddr)
-            {
-                auto* bcast = reinterpret_cast<sockaddr_in*>(ifa->ifa_broadaddr);
-                addTarget(bcast->sin_addr);
-            }
-            else
-            {
-                auto* sa = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
-                uint32_t ip = ntohl(sa->sin_addr.s_addr);
-                in_addr bcast;
-                bcast.s_addr = htonl((ip & 0xFFFFFF00u) | 0xFFu);
-                addTarget(bcast);
-            }
-        }
-        freeifaddrs(ifaddr);
-    }
-    #endif
-
-    // Also poke the configured controller IP directly.
-    if (m_destAddr.sin_addr.s_addr != 0)
-        addTarget(m_destAddr.sin_addr);
-}
-
-bool DDPOutputCHOP::parseStatusReply(const char* buffer, int length, const sockaddr_in& from, std::string& outInfo)
-{
-    if (!buffer || length < DDP_HEADER_SIZE)
-        return false;
-
-    const auto* bytes = reinterpret_cast<const uint8_t*>(buffer);
-    uint8_t flags = bytes[0];
-    uint8_t id = bytes[3];
-    if ((flags & DDP_FLAGS1_REPLY) == 0)
-        return false;
-    if (id != DDP_ID_STATUS)
-        return false;
-
-    char ipStr[INET_ADDRSTRLEN] = {};
-    inet_ntop(AF_INET, &from.sin_addr, ipStr, INET_ADDRSTRLEN);
-    outInfo = ipStr;
-
-    uint16_t dataLen = static_cast<uint16_t>((bytes[8] << 8) | bytes[9]);
-    int payloadStart = DDP_HEADER_SIZE;
-    if (flags & DDP_FLAGS1_TIME)
-        payloadStart += 4;
-    if (dataLen > 0 && payloadStart + dataLen <= length)
-    {
-        std::string json(buffer + payloadStart, buffer + payloadStart + dataLen);
-        auto extract = [&json](const char* key) -> std::string
-        {
-            std::string needle = std::string("\"") + key + "\"";
-            size_t pos = json.find(needle);
-            if (pos == std::string::npos)
-                return {};
-            pos = json.find(':', pos + needle.size());
-            if (pos == std::string::npos)
-                return {};
-            pos = json.find('"', pos + 1);
-            if (pos == std::string::npos)
-                return {};
-            size_t end = json.find('"', pos + 1);
-            if (end == std::string::npos)
-                return {};
-            return json.substr(pos + 1, end - pos - 1);
-        };
-
-        std::string man = extract("man");
-        std::string mod = extract("mod");
-        if (!man.empty() || !mod.empty())
-        {
-            outInfo += " (";
-            if (!man.empty())
-                outInfo += man;
-            if (!man.empty() && !mod.empty())
-                outInfo += " ";
-            if (!mod.empty())
-                outInfo += mod;
-            outInfo += ")";
-        }
-    }
-
-    return true;
-}
-
-void DDPOutputCHOP::discoverDevices()
-{
-    m_discoveredDevices.clear();
-    m_isDiscovering = true;
-
-    if (!ensureNetworking())
-    {
-        m_isDiscovering = false;
-        return;
-    }
-
-    #ifdef _WIN32
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == INVALID_SOCKET)
-    {
-        m_lastError = "Discovery: socket creation failed";
-        m_isDiscovering = false;
-        return;
-    }
-    BOOL broadcastEnable = TRUE;
-    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (char*)&broadcastEnable, sizeof(broadcastEnable));
-    u_long nonBlocking = 1;
-    ioctlsocket(sock, FIONBIO, &nonBlocking);
-    #else
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0)
-    {
-        m_lastError = "Discovery: socket creation failed";
-        m_isDiscovering = false;
-        return;
-    }
-    int broadcastEnable = 1;
-    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
-    int sockFlags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, sockFlags | O_NONBLOCK);
-    #endif
-
-    sockaddr_in localAddr;
-    memset(&localAddr, 0, sizeof(localAddr));
-    localAddr.sin_family = AF_INET;
-    localAddr.sin_addr.s_addr = INADDR_ANY;
-    localAddr.sin_port = htons(0);
-    #ifdef _WIN32
-    if (bind(sock, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) == SOCKET_ERROR)
-    {
-        m_lastError = "Discovery: bind failed";
-        closesocket(sock);
-        m_isDiscovering = false;
-        return;
-    }
-    #else
-    if (bind(sock, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) < 0)
-    {
-        m_lastError = "Discovery: bind failed";
-        close(sock);
-        m_isDiscovering = false;
-        return;
-    }
-    #endif
-
-    std::vector<sockaddr_in> targets;
-    collectBroadcastTargets(targets);
-
-    m_lastError = "Sending discovery query to " + std::to_string(targets.size()) + " address(es)...";
-
-    auto sendAll = [this, sock, &targets]()
-    {
-        for (const sockaddr_in& dest : targets)
-            sendDiscoveryQuery(sock, dest);
-    };
-
-    // A few spaced queries; devices may delay replies by MAC (spec ~500 ms window).
-    sendAll();
-    #ifdef _WIN32
-        Sleep(40);
-    #else
-        usleep(40000);
-    #endif
-    sendAll();
-    #ifdef _WIN32
-        Sleep(40);
-    #else
-        usleep(40000);
-    #endif
-    sendAll();
-
-    char buffer[2048];
-    sockaddr_in responseAddr;
-    int packetsReceived = 0;
-    const int polls = DDP_DISCOVERY_WAIT_MS / 10;
-    for (int i = 0; i < polls; i++)
-    {
-        #ifdef _WIN32
-        int addrLen = sizeof(responseAddr);
-        #else
-        socklen_t addrLen = sizeof(responseAddr);
-        #endif
-
-        while (true)
-        {
-            #ifdef _WIN32
-            addrLen = sizeof(responseAddr);
-            #else
-            addrLen = sizeof(responseAddr);
-            #endif
-            int received = recvfrom(sock, buffer, sizeof(buffer), 0,
-                                    reinterpret_cast<sockaddr*>(&responseAddr), &addrLen);
-            if (received <= 0)
-                break;
-
-            packetsReceived++;
-            std::string deviceInfo;
-            if (!parseStatusReply(buffer, received, responseAddr, deviceInfo))
-                continue;
-
-            size_t ipEnd = deviceInfo.find_first_of(" :");
-            std::string ipOnly = deviceInfo.substr(0, ipEnd == std::string::npos ? deviceInfo.size() : ipEnd);
-
-            bool found = false;
-            for (const auto& dev : m_discoveredDevices)
-            {
-                size_t existingEnd = dev.find_first_of(" :");
-                std::string existingIp = dev.substr(0, existingEnd == std::string::npos ? dev.size() : existingEnd);
-                if (existingIp == ipOnly)
-                {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found)
-            {
-                m_discoveredDevices.push_back(deviceInfo);
-                m_lastError = "Found device: " + deviceInfo;
-            }
-        }
-
-        #ifdef _WIN32
-            Sleep(10);
-        #else
-            usleep(10000);
-        #endif
-    }
-
-    #ifdef _WIN32
-        closesocket(sock);
-    #else
-        close(sock);
-    #endif
-
-    m_isDiscovering = false;
-
-    if (m_discoveredDevices.empty())
-    {
-        m_lastError = "Discovery complete: 0 devices (" + std::to_string(packetsReceived)
-            + " packet(s)). Controllers must answer DDP JSON status (ID 251). "
-              "WLED often does not. Check subnet/firewall, or enter IPs in the routing table.";
-    }
-    else
-    {
-        m_lastError = "Discovery complete: " + std::to_string(m_discoveredDevices.size())
-            + " device(s) found (" + std::to_string(packetsReceived) + " packet(s))";
-    }
-}
-
-bool DDPOutputCHOP::shouldSendFrame(double targetFPS)
-{
-    if (targetFPS <= 0)
-        return true; // No limit
-    
-    // Get current time in seconds
-    auto now = std::chrono::high_resolution_clock::now();
-    auto duration = now.time_since_epoch();
-    double currentTime = std::chrono::duration<double>(duration).count();
-    
-    // Calculate minimum time between frames
-    double minFrameTime = 1.0 / targetFPS;
-    double elapsed = currentTime - m_lastFrameTime;
-    
-    if (elapsed >= minFrameTime)
-    {
-        m_lastFrameTime = currentTime;
-        return true;
-    }
-    
-    return false; // Too soon, skip this frame
 }
 
